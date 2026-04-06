@@ -2,8 +2,6 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import axios from "axios";
-import fs from "fs";
-
 import { OpenAI } from "openai";
 
 dotenv.config();
@@ -12,29 +10,27 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// ✅ Test route
 app.get("/", (_req, res) => {
   res.json({ message: "Mind Tranceform backend is running" });
 });
 
-// 🔥 MAIN ROUTE (UPDATED)
 app.post("/generate-session", async (req, res) => {
   try {
     const { name, goal, program, voice } = req.body;
 
-    // 🧠 STEP 1 — Generate script with OpenAI
     const prompt = `
 Create a calming, personalized hypnosis session.
 
 User Name: ${name}
 Goal: ${goal}
 Program Type: ${program}
+Preferred Voice Style: ${voice}
 
 Make it relaxing, second-person, and about 2 minutes long.
 Include breathing guidance and emotional reassurance.
@@ -47,7 +43,6 @@ Include breathing guidance and emotional reassurance.
 
     const script = aiResponse.choices[0].message.content;
 
-    // 🔊 STEP 2 — Convert to voice (ElevenLabs)
     const voiceId = "21m00Tcm4TlvDq8ikWAM";
 
     const audioResponse = await axios({
@@ -64,25 +59,22 @@ Include breathing guidance and emotional reassurance.
       responseType: "arraybuffer",
     });
 
-    // 💾 Save audio
-    const filePath = "audio.mp3";
-    fs.writeFileSync(filePath, audioResponse.data);
+    const audioBase64 = Buffer.from(audioResponse.data).toString("base64");
 
-    // 🌐 Return response
     res.json({
       success: true,
       script,
-      audioUrl: "https://mindtranceform-backend.onrender.com/audio.mp3"
+      audioBase64,
+      mimeType: "audio/mpeg",
     });
-
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ success: false, error: "Failed to generate session" });
+    console.error("Generation error:", error?.response?.data || error.message || error);
+    res.status(500).json({
+      success: false,
+      error: error?.response?.data || error.message || "Failed to generate session",
+    });
   }
 });
-
-// Serve audio file
-app.use(express.static("."));
 
 app.listen(PORT, () => {
   console.log(`Mind Tranceform backend running on port ${PORT}`);
