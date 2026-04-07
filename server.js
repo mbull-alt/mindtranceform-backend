@@ -1,53 +1,28 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import axios from "axios";
-import { OpenAI } from "openai";
-
-dotenv.config();
-
-const app = express();
-const PORT = process.env.PORT || 8080;
-
-app.use(cors());
-app.use(express.json({ limit: "10mb" }));
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-app.get("/", (_req, res) => {
-  res.json({ message: "Mind Tranceform backend is running" });
-});
-
 app.post("/generate-session", async (req, res) => {
   try {
     const { name, goal, program, voice } = req.body;
 
-    const prompt = `
-Create a calming, personalized hypnosis session.
+    const script = `
+Hello ${name || "friend"}.
 
-User Name: ${name}
-Goal: ${goal}
-Program Type: ${program}
-Preferred Voice Style: ${voice}
+This is your personalized ${program || "meditation"} session.
 
-Make it relaxing, second-person, and about 2 minutes long.
-Include breathing guidance and emotional reassurance.
+Today we are focusing on ${goal || "calm, clarity, and peace"}.
+
+Take a deep breath in.
+And slowly exhale.
+
+Allow your body to relax.
+Allow your mind to slow down.
+You are safe.
+You are supported.
+You are moving toward the life you want.
 `;
 
-    const aiResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-    });
-
-    const script = aiResponse.choices[0].message.content;
-
-    const voiceId = "21m00Tcm4TlvDq8ikWAM";
-
+    // 🔊 ElevenLabs request
     const audioResponse = await axios({
       method: "POST",
-      url: `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+      url: "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM",
       headers: {
         "xi-api-key": process.env.ELEVENLABS_API_KEY,
         "Content-Type": "application/json",
@@ -59,23 +34,21 @@ Include breathing guidance and emotional reassurance.
       responseType: "arraybuffer",
     });
 
+    // ✅ Convert to base64 (NO FILE SAVING)
     const audioBase64 = Buffer.from(audioResponse.data).toString("base64");
 
+    // ✅ Return clean response
     res.json({
       success: true,
       script,
       audioBase64,
-      mimeType: "audio/mpeg",
     });
   } catch (error) {
-    console.error("Generation error:", error?.response?.data || error.message || error);
+    console.error("🔥 ERROR:", error?.response?.data || error.message);
+
     res.status(500).json({
       success: false,
-      error: error?.response?.data || error.message || "Failed to generate session",
+      error: error?.response?.data || error.message || "Failed",
     });
   }
-});
-
-app.listen(PORT, () => {
-  console.log(`Mind Tranceform backend running on port ${PORT}`);
 });
