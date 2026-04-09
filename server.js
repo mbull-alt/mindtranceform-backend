@@ -260,13 +260,13 @@ app.post("/verify-payment", async (req, res) => {
 });
 
 app.post("/generate-session", requireAuth, async (req, res) => {
-  const { name, goal, program, voice, background, duration } = req.body;
+  const { name, goal, program, voice, background, length, style, personalization, fears, motivation, idealLife, affirmationStyle, backgroundIntensity } = req.body;
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
-  const mins = parseInt(duration) || 5;
+  const mins = parseInt(length) || 5;
   const wordTarget = { 5: 450, 10: 900, 15: 1350, 20: 1800, 30: 2700 }[mins] || 450;
   const maxTokens = Math.ceil(wordTarget * 1.5);
   try {
-    const prompt = buildPrompt({ name, goal, program, voice, background, wordTarget });
+    const prompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, affirmationStyle, backgroundIntensity, wordTarget });
     const aiResponse = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       { model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens, temperature: 0.85 },
@@ -294,7 +294,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       id: Date.now().toString(),
       user_id: req.user.id,
       email: req.user.email,
-      title: `${program} — ${new Date().toLocaleDateString()}`,
+      title: `${program} — ${style || "Gentle Meditation"} — ${mins} min`,
       program, voice, background, script,
       audio_base64: audioBase64,
     });
@@ -399,30 +399,57 @@ app.get("/sessions/:id", requireAuth, async (req, res) => {
 });
 
 // ─── PROMPT ───────────────────────────────────────────────────────────────────
-function buildPrompt({ name, goal, program, voice, background, wordTarget = 450 }) {
+function buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, affirmationStyle, backgroundIntensity, wordTarget = 450 }) {
   const endings = {
-    "Sleep": "End with suggestions to drift into deep restful sleep. Do NOT include a wake-up.",
+    "Sleep":            "End with suggestions to drift into deep restful sleep. Do NOT include a wake-up.",
     "Stress & Anxiety": "End with a calming positive anchor for the rest of the day.",
-    "Abundance": "End with vivid visualization of success and receiving.",
+    "Abundance":        "End with vivid visualization of success and receiving.",
   };
+  const styleGuides = {
+    "Gentle Meditation": "Use a soft, nurturing tone. Keep pacing gentle and reassuring throughout.",
+    "Deep Hypnosis":     "Use a slow, authoritative hypnotic tone. Include progressive deepening language and trance-induction techniques.",
+    "Affirmations Only": "Structure the session primarily around powerful affirmations, repeated and varied for emphasis. Minimize narrative.",
+    "Visualization":     "Lead through a detailed, vivid mental journey. Engage all five senses in every scene.",
+    "Sleep Induction":   "Use an extremely slow, drowsy pace. Progressively increase suggestions of heaviness, warmth, and sleep.",
+    "Confidence Boost":  "Use an empowering, uplifting tone. Build momentum and inner strength throughout the session.",
+  };
+  const affirmGuides = {
+    "I am":          'Write affirmations in first person: "I am..." format.',
+    "You are":       'Write affirmations in second person: "You are..." format.',
+    "Present tense": "Write affirmations as present-tense truths, as if already fully achieved.",
+    "Future tense":  "Write affirmations as future certainties, planting seeds of what is coming.",
+  };
+  const intensityGuides = {
+    "Subtle":    "Mention the background sound lightly at the start only. Keep the focus entirely on the voice.",
+    "Balanced":  "Reference the background sound occasionally throughout to anchor the listener.",
+    "Immersive": "Weave the background sound throughout as an integral, living part of the experience.",
+  };
+
+  const deepContext = personalization === "deep" && (fears || motivation || idealLife)
+    ? `\nDeep personalization:\n${fears ? `- Fear / what to release: ${fears}` : ""}\n${motivation ? `- Core motivation: ${motivation}` : ""}\n${idealLife ? `- Ideal life vision: ${idealLife}` : ""}`.trim()
+    : "";
+
   return `Write a personalized guided ${program} meditation/hypnosis session.
 Name: ${name}
 Goal: ${goal}
 Program: ${program}
 Voice style: ${voice || "Female Calm"}
-Background: ${background || "432 Hz"}
+Background sound: ${background || "432 Hz"}
+Session style: ${style || "Gentle Meditation"}${deepContext}
 
 Rules:
 1. Use ${name}'s name at least 4 times throughout.
 2. Write in second person.
 3. Begin with 3 slow breathing instructions.
-4. Include a body scan relaxation head to toe.
+4. Include a body scan relaxation from head to toe.
 5. Countdown from 10 to 1 to deepen the state.
-6. Weave "${goal}" into vivid positive suggestions and visualization.
-7. Include 3 personalized affirmations tied directly to their goal.
-8. ${endings[program] || "End positively."}
-9. ${wordTarget - 50}-${wordTarget + 50} words. Use "..." for pauses.
-10. Output ONLY the script. No titles or commentary.`;
+6. Weave "${goal}" into vivid positive suggestions and visualization.${deepContext ? "\n7. Incorporate the deep personalization details naturally into the script." : ""}
+${deepContext ? "8" : "7"}. Include 3 personalized affirmations tied directly to their goal. ${affirmGuides[affirmationStyle] || affirmGuides["I am"]}
+${deepContext ? "9" : "8"}. ${endings[program] || "End positively."}
+${deepContext ? "10" : "9"}. Style: ${styleGuides[style] || styleGuides["Gentle Meditation"]}
+${deepContext ? "11" : "10"}. Background: ${intensityGuides[backgroundIntensity] || intensityGuides["Balanced"]}
+${deepContext ? "12" : "11"}. ${wordTarget - 50}–${wordTarget + 50} words. Use "..." for natural pauses.
+${deepContext ? "13" : "12"}. Output ONLY the script. No titles, labels, or commentary.`;
 }
 
 app.listen(PORT, () => {
