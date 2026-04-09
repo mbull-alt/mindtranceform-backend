@@ -20,6 +20,15 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 
+async function requireAuth(req, res, next) {
+  const token = req.headers.authorization?.replace("Bearer ", "");
+  if (!token) return res.status(401).json({ success: false, error: "Unauthorized" });
+  const { data: { user }, error } = await supabase.auth.getUser(token);
+  if (error || !user) return res.status(401).json({ success: false, error: "Unauthorized" });
+  req.user = user;
+  next();
+}
+
 const VOICE_MAP = {
   "Female Calm": process.env.ELEVENLABS_VOICE_FEMALE_CALM || "21m00Tcm4TlvDq8ikWAM",
   "Male Calm":   process.env.ELEVENLABS_VOICE_MALE_CALM   || "TxGEqnHWrfWFTfGW9XjX",
@@ -69,7 +78,7 @@ app.post("/verify-payment", async (req, res) => {
   }
 });
 
-app.post("/generate-session", async (req, res) => {
+app.post("/generate-session", requireAuth, async (req, res) => {
   const { name, goal, program, voice, background, email } = req.body;
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
   try {
@@ -96,27 +105,26 @@ app.post("/generate-session", async (req, res) => {
       console.error("ElevenLabs error:", audioErrMsg);
       audioUnavailable = true;
     }
-    if (email) {
-      await supabase.from("sessions").insert({
-        id: Date.now().toString(),
-        email,
-        title: `${program} — ${new Date().toLocaleDateString()}`,
-        program,
-        voice,
-        background,
-        script,
-        audio_base64: audioBase64,
-      });
-      // Keep only the 10 most recent sessions per user
-      const { data: old } = await supabase
-        .from("sessions")
-        .select("id")
-        .eq("email", email)
-        .order("created_at", { ascending: false })
-        .range(10, 1000);
-      if (old?.length) {
-        await supabase.from("sessions").delete().in("id", old.map((s) => s.id));
-      }
+    await supabase.from("sessions").insert({
+      id: Date.now().toString(),
+      user_id: req.user.id,
+      email: req.user.email,
+      title: `${program} — ${new Date().toLocaleDateString()}`,
+      program,
+      voice,
+      background,
+      script,
+      audio_base64: audioBase64,
+    });
+    // Keep only the 10 most recent sessions per user
+    const { data: old } = await supabase
+      .from("sessions")
+      .select("id")
+      .eq("user_id", req.user.id)
+      .order("created_at", { ascending: false })
+      .range(10, 1000);
+    if (old?.length) {
+      await supabase.from("sessions").delete().in("id", old.map((s) => s.id));
     }
     return res.json({ success: true, script, audioBase64, audioUnavailable });
   } catch (err) {
@@ -143,24 +151,22 @@ app.get("/test-elevenlabs", async (_req, res) => {
   }
 });
 
-app.get("/sessions/:email", async (req, res) => {
-  const email = decodeURIComponent(req.params.email);
+app.get("/sessions", requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from("sessions")
-    .select("id, title, program, voice, background, script, created_at")
-    .eq("email", email)
+    .select("id, title, program, voice, background, created_at")
+    .eq("user_id", req.user.id)
     .order("created_at", { ascending: false })
     .limit(10);
   if (error) return res.status(500).json({ success: false, error: error.message });
   res.json({ success: true, sessions: data || [] });
 });
 
-app.get("/sessions/:email/:id", async (req, res) => {
-  const email = decodeURIComponent(req.params.email);
+app.get("/sessions/:id", requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from("sessions")
     .select("*")
-    .eq("email", email)
+    .eq("user_id", req.user.id)
     .eq("id", req.params.id)
     .single();
   if (error || !data) return res.status(404).json({ success: false, error: "Session not found." });
