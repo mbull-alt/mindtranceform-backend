@@ -77,18 +77,26 @@ app.post("/generate-session", async (req, res) => {
     const script = aiResponse.data.choices[0]?.message?.content?.trim();
     if (!script) throw new Error("No script returned from AI.");
     const voiceId = VOICE_MAP[voice] || VOICE_MAP["Female Calm"];
-    const audioResponse = await axios.post(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-      { text: script, model_id: "eleven_monolingual_v1", voice_settings: { stability: 0.6, similarity_boost: 0.8 } },
-      { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer" }
-    );
-    const audioBase64 = Buffer.from(audioResponse.data).toString("base64");
+    let audioBase64 = null;
+    let audioUnavailable = false;
+    try {
+      const audioResponse = await axios.post(
+        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+        { text: script, model_id: "eleven_monolingual_v1", voice_settings: { stability: 0.6, similarity_boost: 0.8 } },
+        { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer" }
+      );
+      audioBase64 = Buffer.from(audioResponse.data).toString("base64");
+    } catch (audioErr) {
+      const audioErrMsg = audioErr?.response?.status || audioErr.message;
+      console.error("ElevenLabs error:", audioErrMsg);
+      audioUnavailable = true;
+    }
     if (email) {
       if (!sessionStore[email]) sessionStore[email] = [];
       sessionStore[email].unshift({ id: Date.now().toString(), title: `${program} — ${new Date().toLocaleDateString()}`, program, voice, background, script, audioBase64, createdAt: new Date().toISOString() });
       if (sessionStore[email].length > 10) sessionStore[email] = sessionStore[email].slice(0, 10);
     }
-    return res.json({ success: true, script, audioBase64 });
+    return res.json({ success: true, script, audioBase64, audioUnavailable });
   } catch (err) {
     const message = err?.response?.data?.error?.message || err.message || "Generation failed.";
     console.error("Generation error:", message);
