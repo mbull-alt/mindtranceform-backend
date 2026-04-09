@@ -260,13 +260,16 @@ app.post("/verify-payment", async (req, res) => {
 });
 
 app.post("/generate-session", requireAuth, async (req, res) => {
-  const { name, goal, program, voice, background } = req.body;
+  const { name, goal, program, voice, background, duration } = req.body;
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
+  const mins = parseInt(duration) || 5;
+  const wordTarget = { 5: 450, 10: 900, 15: 1350, 20: 1800, 30: 2700 }[mins] || 450;
+  const maxTokens = Math.ceil(wordTarget * 1.5);
   try {
-    const prompt = buildPrompt({ name, goal, program, voice, background });
+    const prompt = buildPrompt({ name, goal, program, voice, background, wordTarget });
     const aiResponse = await axios.post(
       "https://api.openai.com/v1/chat/completions",
-      { model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: 700, temperature: 0.85 },
+      { model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens, temperature: 0.85 },
       { headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" } }
     );
     const script = aiResponse.data.choices[0]?.message?.content?.trim();
@@ -396,7 +399,7 @@ app.get("/sessions/:id", requireAuth, async (req, res) => {
 });
 
 // ─── PROMPT ───────────────────────────────────────────────────────────────────
-function buildPrompt({ name, goal, program, voice, background }) {
+function buildPrompt({ name, goal, program, voice, background, wordTarget = 450 }) {
   const endings = {
     "Sleep": "End with suggestions to drift into deep restful sleep. Do NOT include a wake-up.",
     "Stress & Anxiety": "End with a calming positive anchor for the rest of the day.",
@@ -418,7 +421,7 @@ Rules:
 6. Weave "${goal}" into vivid positive suggestions and visualization.
 7. Include 3 personalized affirmations tied directly to their goal.
 8. ${endings[program] || "End positively."}
-9. 350-450 words. Use "..." for pauses.
+9. ${wordTarget - 50}-${wordTarget + 50} words. Use "..." for pauses.
 10. Output ONLY the script. No titles or commentary.`;
 }
 
