@@ -136,4 +136,7 @@ Rules:
 10. Output ONLY the script. No titles or commentary.`;
 }
 
-app.listen(PORT, () => console.log(`Mind Tranceform backend running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Mind Tranceform backend running on port ${PORT}`);
+  console.log(`ElevenLabs key loaded: ${process.env.ELEVENLABS_API_KEY ? "YES (" + process.env.ELEVENLABS_API_KEY.slice(0, 8) + "...)" : "MISSING"}`);
+});
