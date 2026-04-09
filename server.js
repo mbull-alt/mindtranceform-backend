@@ -401,9 +401,15 @@ app.get("/sessions/:id", requireAuth, async (req, res) => {
 // ─── PROMPT ───────────────────────────────────────────────────────────────────
 function buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, affirmationStyle, backgroundIntensity, wordTarget = 450 }) {
   const endings = {
-    "Sleep":            "End with suggestions to drift into deep restful sleep. Do NOT include a wake-up.",
-    "Stress & Anxiety": "End with a calming positive anchor for the rest of the day.",
-    "Abundance":        "End with vivid visualization of success and receiving.",
+    "Sleep":                "End with suggestions to drift into deep restful sleep. Do NOT include a wake-up.",
+    "Stress & Anxiety":     "End with a calming positive anchor for the rest of the day.",
+    "Abundance":            "End with vivid visualization of success and receiving.",
+    "Confidence":           "End with a powerful surge of inner certainty — the felt sense that they are capable, worthy, and unstoppable.",
+    "Focus & Productivity": "End with a clear, energized mental anchor state of sharp focus they can return to instantly at any time.",
+    "Quit Smoking":         "End with a vivid feeling of freedom, clean lungs, and deep pride in choosing to be free. No mention of cravings.",
+    "Weight Loss Mindset":  "End with a positive body image visualization and the full feeling of living energetically in a healthy body.",
+    "Relationship Healing": "End with an open heart, inner peace, and genuine readiness to give and receive love freely.",
+    "Abundance & Wealth":   "End with a vivid felt experience of financial freedom and deep certainty that wealth flows naturally to them.",
   };
   const styleGuides = {
     "Gentle Meditation": "Use a soft, nurturing tone. Keep pacing gentle and reassuring throughout.",
