@@ -82,7 +82,7 @@ app.post("/generate-session", async (req, res) => {
     try {
       const audioResponse = await axios.post(
         `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-        { text: script, model_id: "eleven_monolingual_v1", voice_settings: { stability: 0.6, similarity_boost: 0.8 } },
+        { text: script, model_id: "eleven_turbo_v2_5", voice_settings: { stability: 0.6, similarity_boost: 0.8 } },
         { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer" }
       );
       audioBase64 = Buffer.from(audioResponse.data).toString("base64");
@@ -110,7 +110,7 @@ app.get("/test-elevenlabs", async (_req, res) => {
   try {
     const r = await axios.post(
       "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM",
-      { text: "Test.", model_id: "eleven_monolingual_v1", voice_settings: { stability: 0.6, similarity_boost: 0.8 } },
+      { text: "Test.", model_id: "eleven_turbo_v2_5", voice_settings: { stability: 0.6, similarity_boost: 0.8 } },
       { headers: { "xi-api-key": key, "Content-Type": "application/json" }, responseType: "arraybuffer" }
     );
     res.json({ ok: true, keyPrefix: key.slice(0, 10) + "...", bytesReceived: r.data.byteLength });
