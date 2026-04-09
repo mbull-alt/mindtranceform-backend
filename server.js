@@ -3,8 +3,14 @@ const cors = require("cors");
 const dotenv = require("dotenv");
 const axios = require("axios");
 const stripe = require("stripe");
+const { createClient } = require("@supabase/supabase-js");
 
 dotenv.config();
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -13,7 +19,6 @@ const stripeClient = stripe(process.env.STRIPE_SECRET_KEY);
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
-const sessionStore = {};
 
 const VOICE_MAP = {
   "Female Calm": process.env.ELEVENLABS_VOICE_FEMALE_CALM || "21m00Tcm4TlvDq8ikWAM",
@@ -92,9 +97,26 @@ app.post("/generate-session", async (req, res) => {
       audioUnavailable = true;
     }
     if (email) {
-      if (!sessionStore[email]) sessionStore[email] = [];
-      sessionStore[email].unshift({ id: Date.now().toString(), title: `${program} — ${new Date().toLocaleDateString()}`, program, voice, background, script, audioBase64, createdAt: new Date().toISOString() });
-      if (sessionStore[email].length > 10) sessionStore[email] = sessionStore[email].slice(0, 10);
+      await supabase.from("sessions").insert({
+        id: Date.now().toString(),
+        email,
+        title: `${program} — ${new Date().toLocaleDateString()}`,
+        program,
+        voice,
+        background,
+        script,
+        audio_base64: audioBase64,
+      });
+      // Keep only the 10 most recent sessions per user
+      const { data: old } = await supabase
+        .from("sessions")
+        .select("id")
+        .eq("email", email)
+        .order("created_at", { ascending: false })
+        .range(10, 1000);
+      if (old?.length) {
+        await supabase.from("sessions").delete().in("id", old.map((s) => s.id));
+      }
     }
     return res.json({ success: true, script, audioBase64, audioUnavailable });
   } catch (err) {
@@ -121,18 +143,29 @@ app.get("/test-elevenlabs", async (_req, res) => {
   }
 });
 
-app.get("/sessions/:email", (req, res) => {
+app.get("/sessions/:email", async (req, res) => {
   const email = decodeURIComponent(req.params.email);
-  const sessions = (sessionStore[email] || []).map(({ audioBase64, ...rest }) => rest);
-  res.json({ success: true, sessions });
+  const { data, error } = await supabase
+    .from("sessions")
+    .select("id, title, program, voice, background, script, created_at")
+    .eq("email", email)
+    .order("created_at", { ascending: false })
+    .limit(10);
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true, sessions: data || [] });
 });
 
-app.get("/sessions/:email/:id", (req, res) => {
+app.get("/sessions/:email/:id", async (req, res) => {
   const email = decodeURIComponent(req.params.email);
-  const sessions = sessionStore[email] || [];
-  const session = sessions.find((s) => s.id === req.params.id);
-  if (!session) return res.status(404).json({ success: false, error: "Session not found." });
-  res.json({ success: true, session });
+  const { data, error } = await supabase
+    .from("sessions")
+    .select("*")
+    .eq("email", email)
+    .eq("id", req.params.id)
+    .single();
+  if (error || !data) return res.status(404).json({ success: false, error: "Session not found." });
+  const { audio_base64, ...rest } = data;
+  res.json({ success: true, session: { ...rest, audioBase64: audio_base64 } });
 });
 
 function buildPrompt({ name, goal, program, voice, background }) {
