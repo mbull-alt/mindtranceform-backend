@@ -104,6 +104,23 @@ app.post("/generate-session", async (req, res) => {
   }
 });
 
+app.get("/test-elevenlabs", async (_req, res) => {
+  const key = process.env.ELEVENLABS_API_KEY;
+  if (!key) return res.json({ ok: false, error: "ELEVENLABS_API_KEY is not set" });
+  try {
+    const r = await axios.post(
+      "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM",
+      { text: "Test.", model_id: "eleven_monolingual_v1", voice_settings: { stability: 0.6, similarity_boost: 0.8 } },
+      { headers: { "xi-api-key": key, "Content-Type": "application/json" }, responseType: "arraybuffer" }
+    );
+    res.json({ ok: true, keyPrefix: key.slice(0, 10) + "...", bytesReceived: r.data.byteLength });
+  } catch (err) {
+    const status = err?.response?.status;
+    const body = err?.response?.data ? Buffer.from(err.response.data).toString("utf8") : err.message;
+    res.json({ ok: false, keyPrefix: key.slice(0, 10) + "...", status, error: body });
+  }
+});
+
 app.get("/sessions/:email", (req, res) => {
   const email = decodeURIComponent(req.params.email);
   const sessions = (sessionStore[email] || []).map(({ audioBase64, ...rest }) => rest);
