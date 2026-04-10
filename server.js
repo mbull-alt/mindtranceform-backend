@@ -4,15 +4,19 @@ const dotenv = require("dotenv");
 const axios = require("axios");
 const stripe = require("stripe");
 const { createClient } = require("@supabase/supabase-js");
-const { Resend } = require("resend");
-
 dotenv.config();
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
-const resend = new Resend(process.env.RESEND_API_KEY);
+
+function getResendClient() {
+  if (!process.env.RESEND_API_KEY) return null;
+  const { Resend } = require("resend");
+  return new Resend(process.env.RESEND_API_KEY);
+}
+
 const FROM = process.env.RESEND_FROM_EMAIL || "Mind Tranceform <onboarding@resend.dev>";
 const APP_URL = process.env.APP_URL || "https://app.mindtranceform.com";
 
@@ -97,6 +101,8 @@ async function hasEmailBeenSent(userId, type) {
 // ─── EMAIL SENDERS ────────────────────────────────────────────────────────────
 async function sendWelcomeEmail(userId, email) {
   if (await hasEmailBeenSent(userId, "seq_day0")) return;
+  const resend = getResendClient();
+  if (!resend) { console.warn("Resend not configured — skipping welcome email"); return; }
   await resend.emails.send({
     from: FROM,
     to: email,
@@ -112,6 +118,8 @@ async function sendWelcomeEmail(userId, email) {
 }
 
 async function sendSessionDeliveryEmail(email, { name, program, voice, script }) {
+  const resend = getResendClient();
+  if (!resend) { console.warn("Resend not configured — skipping session delivery email"); return; }
   const previewScript = script.slice(0, 600) + (script.length > 600 ? "..." : "");
   await resend.emails.send({
     from: FROM,
@@ -186,6 +194,8 @@ async function sendSequenceEmail(userId, email, day) {
   const emailData = emails[day];
   if (!emailData) return false;
 
+  const resend = getResendClient();
+  if (!resend) { console.warn("Resend not configured — skipping sequence email day", day); return false; }
   await resend.emails.send({ from: FROM, to: email, ...emailData });
   await logEmail(userId, email, type);
   return true;
