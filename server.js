@@ -25,7 +25,14 @@ const PORT = process.env.PORT || 8080;
 const stripeClient = stripe(process.env.STRIPE_SECRET_KEY);
 
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+// Stripe webhooks require the raw body — all other routes get JSON parsing
+app.use((req, res, next) => {
+  if (req.path === "/webhook/stripe") {
+    express.raw({ type: "application/json" })(req, res, next);
+  } else {
+    express.json({ limit: "10mb" })(req, res, next);
+  }
+});
 
 // ─── AUTH MIDDLEWARE ──────────────────────────────────────────────────────────
 async function requireAuth(req, res, next) {
@@ -492,6 +499,157 @@ ${deepContext ? "11" : "10"}. Background: ${intensityGuides[backgroundIntensity]
 ${deepContext ? "12" : "11"}. ${wordTarget - 50}–${wordTarget + 50} words. Use "..." for natural pauses.
 ${deepContext ? "13" : "12"}. Output ONLY the script. No titles, labels, or commentary.`;
 }
+
+// ─── STRIPE WEBHOOK ──────────────────────────────────────────────────────────
+app.post("/webhook/stripe", async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!secret) return res.status(500).json({ error: "Webhook secret not configured" });
+
+  let event;
+  try {
+    event = stripeClient.webhooks.constructEvent(req.body, sig, secret);
+  } catch (err) {
+    console.error("Webhook signature error:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object;
+        const email = session.customer_email || session.metadata?.email;
+        const plan  = session.metadata?.plan;
+        if (email && plan) {
+          await supabase.from("user_profiles").upsert({
+            email,
+            is_subscriber: true,
+            plan,
+            stripe_customer_id:      session.customer      || null,
+            stripe_subscription_id:  session.subscription  || null,
+            subscription_status:     "active",
+          }, { onConflict: "email" });
+        }
+        break;
+      }
+
+      case "customer.subscription.deleted": {
+        const sub = event.data.object;
+        await supabase.from("user_profiles")
+          .update({ plan: null, is_subscriber: false, subscription_status: "cancelled", stripe_subscription_id: null })
+          .eq("stripe_customer_id", sub.customer);
+        break;
+      }
+
+      case "customer.subscription.updated": {
+        const sub = event.data.object;
+        const priceId = sub.items?.data[0]?.price?.id;
+        const priceMap = {
+          [process.env.STRIPE_PRICE_SINGLE]:  "single",
+          [process.env.STRIPE_PRICE_PREMIUM]: "premium",
+          [process.env.STRIPE_PRICE_PRO]:     "pro",
+        };
+        const newPlan = priceMap[priceId];
+        const periodEnd = sub.current_period_end
+          ? new Date(sub.current_period_end * 1000).toISOString()
+          : null;
+        await supabase.from("user_profiles")
+          .update({
+            ...(newPlan ? { plan: newPlan } : {}),
+            subscription_status: sub.status,
+            current_period_end:  periodEnd,
+          })
+          .eq("stripe_subscription_id", sub.id);
+        break;
+      }
+
+      case "invoice.payment_failed": {
+        const invoice = event.data.object;
+        const { data: profile } = await supabase.from("user_profiles")
+          .select("email")
+          .eq("stripe_customer_id", invoice.customer)
+          .single();
+        if (profile?.email) {
+          await supabase.from("user_profiles")
+            .update({ subscription_status: "past_due" })
+            .eq("stripe_customer_id", invoice.customer);
+          const resend = getResendClient();
+          if (resend) {
+            resend.emails.send({
+              from: FROM,
+              to: profile.email,
+              subject: "Your Mind Tranceform payment failed",
+              html: emailWrap(
+                h("Payment failed") +
+                p("We weren't able to process your Mind Tranceform payment. Please update your payment method to keep access to your sessions.") +
+                cta("Update Payment Method →", APP_URL)
+              ),
+            }).catch(console.error);
+          }
+        }
+        break;
+      }
+    }
+  } catch (err) {
+    console.error("Webhook handler error:", err.message);
+  }
+
+  res.json({ received: true });
+});
+
+// ─── CANCEL SUBSCRIPTION ─────────────────────────────────────────────────────
+app.post("/cancel-subscription", requireAuth, async (req, res) => {
+  try {
+    const { data: profile } = await supabase.from("user_profiles")
+      .select("stripe_subscription_id")
+      .eq("user_id", req.user.id)
+      .single();
+    if (!profile?.stripe_subscription_id) {
+      return res.status(400).json({ success: false, error: "No active subscription found." });
+    }
+    await stripeClient.subscriptions.update(profile.stripe_subscription_id, {
+      cancel_at_period_end: true,
+    });
+    await supabase.from("user_profiles")
+      .update({ subscription_status: "cancelling" })
+      .eq("user_id", req.user.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── SUBSCRIPTION STATUS ──────────────────────────────────────────────────────
+app.get("/subscription-status", requireAuth, async (req, res) => {
+  try {
+    const { data: profile } = await supabase.from("user_profiles")
+      .select("plan, subscription_status, current_period_end, stripe_subscription_id, email")
+      .eq("user_id", req.user.id)
+      .single();
+    if (!profile) return res.json({ success: true, plan: null, status: "free", nextBillingDate: null });
+
+    let nextBillingDate = profile.current_period_end || null;
+    if (profile.stripe_subscription_id) {
+      try {
+        const sub = await stripeClient.subscriptions.retrieve(profile.stripe_subscription_id);
+        nextBillingDate = new Date(sub.current_period_end * 1000).toISOString();
+        await supabase.from("user_profiles")
+          .update({ subscription_status: sub.status, current_period_end: nextBillingDate })
+          .eq("user_id", req.user.id);
+      } catch {}
+    }
+
+    res.json({
+      success: true,
+      plan:           profile.plan || null,
+      status:         profile.subscription_status || "active",
+      nextBillingDate,
+      email:          profile.email || req.user.email,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`Mind Tranceform backend running on port ${PORT}`);
