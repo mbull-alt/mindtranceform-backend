@@ -671,12 +671,17 @@ app.get("/subscription-status", requireAuth, async (req, res) => {
     if (!profile) return res.json({ success: true, plan: null, status: "free", nextBillingDate: null });
 
     let nextBillingDate = profile.current_period_end || null;
+    let resolvedStatus  = profile.subscription_status || "active";
+
     if (profile.stripe_subscription_id) {
       try {
         const sub = await stripeClient.subscriptions.retrieve(profile.stripe_subscription_id);
         nextBillingDate = new Date(sub.current_period_end * 1000).toISOString();
+        // cancel_at_period_end means the sub is still "active" in Stripe but
+        // will not renew — we surface this as "cancelling" so the UI shows correctly
+        resolvedStatus = sub.cancel_at_period_end ? "cancelling" : sub.status;
         await supabase.from("user_profiles")
-          .update({ subscription_status: sub.status, current_period_end: nextBillingDate })
+          .update({ subscription_status: resolvedStatus, current_period_end: nextBillingDate })
           .eq("user_id", req.user.id);
       } catch {}
     }
@@ -684,7 +689,7 @@ app.get("/subscription-status", requireAuth, async (req, res) => {
     res.json({
       success: true,
       plan:           profile.plan || null,
-      status:         profile.subscription_status || "active",
+      status:         resolvedStatus,
       nextBillingDate,
       email:          profile.email || req.user.email,
     });
