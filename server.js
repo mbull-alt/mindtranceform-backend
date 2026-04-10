@@ -216,6 +216,8 @@ app.get("/", (_req, res) => {
 // Register user profile + send welcome email
 app.post("/user/register", requireAuth, async (req, res) => {
   const { id: userId, email } = req.user;
+  // Anonymous/guest users have no email — skip profile creation
+  if (!email) return res.json({ success: true, guest: true });
   try {
     const { data: existing } = await supabase
       .from("user_profiles")
@@ -313,7 +315,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     await supabase.from("sessions").insert({
       id: Date.now().toString(),
       user_id: req.user.id,
-      email: req.user.email,
+      email: req.user.email || null,
       title: `${program} — ${style || "Gentle Meditation"} — ${mins} min`,
       program, voice, background, script,
       audio_base64: audioBase64,
@@ -499,6 +501,46 @@ ${deepContext ? "11" : "10"}. Background: ${intensityGuides[backgroundIntensity]
 ${deepContext ? "12" : "11"}. ${wordTarget - 50}–${wordTarget + 50} words. Use "..." for natural pauses.
 ${deepContext ? "13" : "12"}. Output ONLY the script. No titles, labels, or commentary.`;
 }
+
+// ─── AUTH VERIFY ─────────────────────────────────────────────────────────────
+// Verifies a Supabase JWT and returns the user's plan + subscription status
+app.post("/auth/verify", requireAuth, async (req, res) => {
+  try {
+    const { data: profile } = await supabase
+      .from("user_profiles")
+      .select("plan, subscription_status, current_period_end, is_subscriber")
+      .eq("user_id", req.user.id)
+      .single();
+    res.json({
+      success: true,
+      user_id: req.user.id,
+      email:   req.user.email || null,
+      guest:   !req.user.email,
+      plan:    profile?.plan || null,
+      status:  profile?.subscription_status || "free",
+      is_subscriber: profile?.is_subscriber || false,
+      current_period_end: profile?.current_period_end || null,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── SESSIONS BY USER ID ──────────────────────────────────────────────────────
+app.get("/sessions/user/:user_id", requireAuth, async (req, res) => {
+  // Enforce that users can only access their own sessions
+  if (req.params.user_id !== req.user.id) {
+    return res.status(403).json({ success: false, error: "Forbidden" });
+  }
+  const { data, error } = await supabase
+    .from("sessions")
+    .select("id, title, program, voice, background, created_at")
+    .eq("user_id", req.user.id)
+    .order("created_at", { ascending: false })
+    .limit(10);
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true, sessions: data || [] });
+});
 
 // ─── STRIPE WEBHOOK ──────────────────────────────────────────────────────────
 app.post("/webhook/stripe", async (req, res) => {
