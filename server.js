@@ -35,9 +35,12 @@ async function requireAuth(req, res, next) {
 
 // ─── VOICE MAP ───────────────────────────────────────────────────────────────
 const VOICE_MAP = {
-  "Female Calm": process.env.ELEVENLABS_VOICE_FEMALE_CALM || "21m00Tcm4TlvDq8ikWAM",
-  "Male Calm":   process.env.ELEVENLABS_VOICE_MALE_CALM   || "TxGEqnHWrfWFTfGW9XjX",
-  "Male Deep":   process.env.ELEVENLABS_VOICE_MALE_DEEP   || "VR6AewLTigWG4xSOukaG",
+  "Female Calm":   process.env.ELEVENLABS_VOICE_FEMALE_CALM   || "21m00Tcm4TlvDq8ikWAM",
+  "Female Warm":   process.env.ELEVENLABS_VOICE_FEMALE_WARM   || "EXAVITQu4vr4xnSDxMaL",
+  "Male Calm":     process.env.ELEVENLABS_VOICE_MALE_CALM     || "TxGEqnHWrfWFTfGW9XjX",
+  "Male Deep":     process.env.ELEVENLABS_VOICE_MALE_DEEP     || "VR6AewLTigWG4xSOukaG",
+  "Male Smooth":   process.env.ELEVENLABS_VOICE_MALE_SMOOTH   || "pNInz6obpgDQGcFmaJgB",
+  "Male Resonant": process.env.ELEVENLABS_VOICE_MALE_RESONANT || "yoZ06aMxZJJ28mfd3POQ",
 };
 
 // ─── EMAIL HELPERS ────────────────────────────────────────────────────────────
@@ -355,6 +358,28 @@ app.post("/cron/email-sequences", async (req, res) => {
   } catch (err) {
     console.error("Cron error:", err.message);
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get("/preview-voice/:voiceName", async (req, res) => {
+  const voiceId = VOICE_MAP[req.params.voiceName];
+  if (!voiceId) return res.status(400).json({ error: "Unknown voice" });
+  try {
+    const r = await axios.post(
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+      {
+        text: "Take a deep breath... and relax. This is what your personalized session will sound like.",
+        model_id: "eleven_turbo_v2_5",
+        voice_settings: { stability: 0.6, similarity_boost: 0.8 },
+      },
+      { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer" }
+    );
+    res.set("Content-Type", "audio/mpeg");
+    res.set("Cache-Control", "public, max-age=86400");
+    res.send(Buffer.from(r.data));
+  } catch (err) {
+    const status = err?.response?.status || 500;
+    res.status(status).json({ error: "Preview unavailable" });
   }
 });
 
