@@ -18,7 +18,7 @@ function getResendClient() {
 }
 
 const FROM = process.env.RESEND_FROM_EMAIL || "Mind Tranceform <noreply@mindtranceform.com>";
-const APP_URL = process.env.APP_URL || "https://app.mindtranceform.com";
+const APP_URL = process.env.APP_URL || "https://app.mindtranceformapp.com";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -41,6 +41,14 @@ async function requireAuth(req, res, next) {
   const { data: { user }, error } = await supabase.auth.getUser(token);
   if (error || !user) return res.status(401).json({ success: false, error: "Unauthorized" });
   req.user = user;
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  const key = process.env.ADMIN_KEY;
+  if (!key || req.headers["x-admin-key"] !== key) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
   next();
 }
 
@@ -107,38 +115,63 @@ async function hasEmailBeenSent(userId, type) {
 
 // ─── EMAIL SENDERS ────────────────────────────────────────────────────────────
 async function sendWelcomeEmail(userId, email) {
-  if (await hasEmailBeenSent(userId, "seq_day0")) return;
+  console.log(`[email] sendWelcomeEmail → userId=${userId} to=${email} from=${FROM}`);
+  if (await hasEmailBeenSent(userId, "seq_day0")) {
+    console.log(`[email] welcome already logged for ${email} — skipping`);
+    return;
+  }
   const resend = getResendClient();
-  if (!resend) { console.warn("Resend not configured — skipping welcome email"); return; }
-  await resend.emails.send({
-    from: FROM,
-    to: email,
-    subject: "Your free session is ready — create it now",
-    html: emailWrap(
-      h("Welcome to Mind Tranceform") +
-      p("Your personalized meditation and hypnosis session is ready to create — it takes less than 2 minutes.") +
-      p("Tell us your name and goal. We'll write a script just for you, voice it with AI, and layer it with healing frequencies. It's entirely yours.") +
-      cta("Create My Session ✦", APP_URL)
-    ),
-  });
-  await logEmail(userId, email, "seq_day0");
+  if (!resend) {
+    console.warn("[email] RESEND_API_KEY not set — skipping welcome email");
+    return;
+  }
+  try {
+    const result = await resend.emails.send({
+      from: FROM,
+      to: email,
+      subject: "Your free session is ready — create it now",
+      html: emailWrap(
+        h("Welcome to Mind Tranceform") +
+        p("Your personalized meditation and hypnosis session is ready to create — it takes less than 2 minutes.") +
+        p("Tell us your name and goal. We'll write a script just for you, voice it with AI, and layer it with healing frequencies. It's entirely yours.") +
+        cta("Create My Session ✦", APP_URL)
+      ),
+    });
+    console.log(`[email] welcome sent ✓ to=${email} id=${result?.data?.id ?? JSON.stringify(result)}`);
+    await logEmail(userId, email, "seq_day0");
+  } catch (err) {
+    console.error(`[email] welcome FAILED to=${email} — ${err?.message}`, err?.response?.data ?? err);
+  }
 }
 
 async function sendSessionDeliveryEmail(email, { name, program, voice, script }) {
+  if (!email) {
+    console.warn("[email] sendSessionDeliveryEmail — no email address (guest user?), skipping");
+    return;
+  }
+  console.log(`[email] sendSessionDeliveryEmail → to=${email} program=${program} from=${FROM}`);
   const resend = getResendClient();
-  if (!resend) { console.warn("Resend not configured — skipping session delivery email"); return; }
+  if (!resend) {
+    console.warn("[email] RESEND_API_KEY not set — skipping session delivery email");
+    return;
+  }
   const previewScript = script.slice(0, 600) + (script.length > 600 ? "..." : "");
-  await resend.emails.send({
-    from: FROM,
-    to: email,
-    subject: `Your ${program} session is ready, ${name}`,
-    html: emailWrap(
-      h(`Your session is ready, ${name}`) +
-      p(`Your personalized <strong style="color:#e8e6f0;">${program}</strong> session has been created with a <strong style="color:#e8e6f0;">${voice}</strong> voice. Open the app to listen, or read your script below.`) +
-      `<div style="background:rgba(255,255,255,0.06);border:0.5px solid rgba(255,255,255,0.1);border-radius:10px;padding:20px;font-size:14px;line-height:1.8;color:#c8c5d8;white-space:pre-wrap;margin-bottom:8px;">${previewScript}</div>` +
-      cta("Listen in App ✦", APP_URL)
-    ),
-  });
+  try {
+    const result = await resend.emails.send({
+      from: FROM,
+      to: email,
+      subject: `Your ${program} session is ready, ${name}`,
+      html: emailWrap(
+        h(`Your session is ready, ${name}`) +
+        p(`Your personalized <strong style="color:#e8e6f0;">${program}</strong> session has been created with a <strong style="color:#e8e6f0;">${voice}</strong> voice. Open the app to listen, or read your script below.`) +
+        `<div style="background:rgba(255,255,255,0.06);border:0.5px solid rgba(255,255,255,0.1);border-radius:10px;padding:20px;font-size:14px;line-height:1.8;color:#c8c5d8;white-space:pre-wrap;margin-bottom:8px;">${previewScript}</div>` +
+        cta("Listen in App ✦", APP_URL)
+      ),
+    });
+    console.log(`[email] session delivery sent ✓ to=${email} id=${result?.data?.id ?? JSON.stringify(result)}`);
+  } catch (err) {
+    console.error(`[email] session delivery FAILED to=${email} — ${err?.message}`, err?.response?.data ?? err);
+  }
 }
 
 async function sendSequenceEmail(userId, email, day) {
@@ -202,10 +235,17 @@ async function sendSequenceEmail(userId, email, day) {
   if (!emailData) return false;
 
   const resend = getResendClient();
-  if (!resend) { console.warn("Resend not configured — skipping sequence email day", day); return false; }
-  await resend.emails.send({ from: FROM, to: email, ...emailData });
-  await logEmail(userId, email, type);
-  return true;
+  if (!resend) { console.warn(`[email] RESEND_API_KEY not set — skipping sequence day ${day}`); return false; }
+  console.log(`[email] sendSequenceEmail day=${day} → to=${email} from=${FROM}`);
+  try {
+    const result = await resend.emails.send({ from: FROM, to: email, ...emailData });
+    console.log(`[email] sequence day=${day} sent ✓ to=${email} id=${result?.data?.id ?? JSON.stringify(result)}`);
+    await logEmail(userId, email, type);
+    return true;
+  } catch (err) {
+    console.error(`[email] sequence day=${day} FAILED to=${email} — ${err?.message}`, err?.response?.data ?? err);
+    return false;
+  }
 }
 
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
@@ -282,7 +322,7 @@ app.post("/verify-payment", async (req, res) => {
 });
 
 app.post("/generate-session", requireAuth, async (req, res) => {
-  const { name, goal, program, voice, background, length, style, personalization, fears, motivation, idealLife, affirmationStyle, backgroundIntensity } = req.body;
+  const { name, goal, program, voice, background, length, style, personalization, fears, motivation, idealLife, affirmationStyle, backgroundIntensity, white_label_id } = req.body;
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
   const mins = parseInt(length) || 5;
   const wordTarget = { 5: 450, 10: 900, 15: 1350, 20: 1800, 30: 2700 }[mins] || 450;
@@ -319,6 +359,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       title: `${program} — ${style || "Gentle Meditation"} — ${mins} min`,
       program, voice, background, script,
       audio_base64: audioBase64,
+      white_label_id: white_label_id || null,
     });
 
     const { data: old } = await supabase
@@ -562,6 +603,18 @@ app.post("/webhook/stripe", async (req, res) => {
         const session = event.data.object;
         const email = session.customer_email || session.metadata?.email;
         const plan  = session.metadata?.plan;
+
+        // White label checkout
+        if (session.metadata?.type === "whitelabel" && session.metadata?.wl_id) {
+          await supabase.from("white_label_accounts").update({
+            active: true,
+            stripe_customer_id:     session.customer     || null,
+            stripe_subscription_id: session.subscription || null,
+          }).eq("id", session.metadata.wl_id);
+          break;
+        }
+
+        // Regular user subscription
         if (email && plan) {
           await supabase.from("user_profiles").upsert({
             email,
@@ -571,6 +624,19 @@ app.post("/webhook/stripe", async (req, res) => {
             stripe_subscription_id:  session.subscription  || null,
             subscription_status:     "active",
           }, { onConflict: "email" });
+        }
+
+        // Process referral reward for this new subscriber
+        if (email) {
+          try {
+            const { data: prof } = await supabase.from("user_profiles")
+              .select("user_id").eq("email", email).single();
+            if (prof?.user_id) {
+              const { data: ref } = await supabase.from("referrals")
+                .select("*").eq("referred_user_id", prof.user_id).eq("status", "pending").single();
+              if (ref) await processReferralReward(ref);
+            }
+          } catch {}
         }
         break;
       }
@@ -698,8 +764,332 @@ app.get("/subscription-status", requireAuth, async (req, res) => {
   }
 });
 
+// ─── REFERRALS ───────────────────────────────────────────────────────────────
+
+async function processReferralReward(referral) {
+  await supabase.from("referrals").update({
+    status: "rewarded",
+    reward_type: "free_month",
+    completed_at: new Date().toISOString(),
+  }).eq("id", referral.id);
+
+  const { data: referrerProfile } = await supabase.from("user_profiles")
+    .select("referral_months_earned, email")
+    .eq("user_id", referral.referrer_user_id)
+    .single();
+
+  if (!referrerProfile) return;
+
+  await supabase.from("user_profiles")
+    .update({ referral_months_earned: (referrerProfile.referral_months_earned || 0) + 1 })
+    .eq("user_id", referral.referrer_user_id);
+
+  const resend = getResendClient();
+  if (!resend) return;
+
+  if (referrerProfile.email) {
+    resend.emails.send({
+      from: FROM,
+      to: referrerProfile.email,
+      subject: "Your friend just joined Mind Tranceform — you earned 1 free month",
+      html: emailWrap(
+        h("You earned 1 free month of Premium ✦") +
+        p("Your referral just subscribed to Mind Tranceform. As a thank you, you've earned 1 free month of Premium added to your account.") +
+        p("We'll apply it to your next billing cycle. Keep sharing — every friend who joins earns you another free month.") +
+        cta("View Your Account →", APP_URL)
+      ),
+    }).catch(console.error);
+  }
+
+  if (referral.referred_email) {
+    resend.emails.send({
+      from: FROM,
+      to: referral.referred_email,
+      subject: "Welcome to Mind Tranceform — your first month is 10% off",
+      html: emailWrap(
+        h("You've got a special offer") +
+        p("A friend referred you to Mind Tranceform. As a thank you, your first month is 10% off — we'll apply the discount automatically.") +
+        p("Enjoy your personalized sessions.") +
+        cta("Start My Session ✦", APP_URL)
+      ),
+    }).catch(console.error);
+  }
+}
+
+// GET /referral/code/:user_id — get or generate referral code + stats
+app.get("/referral/code/:user_id", requireAuth, async (req, res) => {
+  if (req.params.user_id !== req.user.id) return res.status(403).json({ success: false, error: "Forbidden" });
+  try {
+    const { data: profile } = await supabase.from("user_profiles")
+      .select("referral_code, email").eq("user_id", req.user.id).single();
+
+    if (!profile) return res.status(404).json({ success: false, error: "Profile not found." });
+
+    let code = profile.referral_code;
+    if (!code) {
+      code = req.user.id.replace(/-/g, "").slice(0, 10).toUpperCase();
+      await supabase.from("user_profiles").update({ referral_code: code }).eq("user_id", req.user.id);
+    }
+
+    const { data: referrals } = await supabase.from("referrals")
+      .select("status").eq("referrer_user_id", req.user.id);
+
+    const total       = referrals?.length || 0;
+    const joined      = referrals?.filter(r => r.status === "completed" || r.status === "rewarded").length || 0;
+    const monthsEarned = referrals?.filter(r => r.status === "rewarded").length || 0;
+
+    res.json({ success: true, code, total, joined, monthsEarned });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /referral/track — record a referral when someone signs up via a ref link
+app.post("/referral/track", requireAuth, async (req, res) => {
+  const { referral_code } = req.body;
+  const referred_user_id  = req.user.id;
+  const referred_email    = req.user.email || null;
+
+  if (!referral_code) return res.status(400).json({ success: false, error: "referral_code required." });
+  try {
+    const { data: referrer } = await supabase.from("user_profiles")
+      .select("user_id, email").eq("referral_code", referral_code).single();
+
+    if (!referrer) return res.status(404).json({ success: false, error: "Invalid referral code." });
+    if (referrer.user_id === referred_user_id) return res.status(400).json({ success: false, error: "Cannot refer yourself." });
+
+    const { data: existing } = await supabase.from("referrals")
+      .select("id").eq("referred_user_id", referred_user_id).limit(1);
+    if (existing?.length) return res.json({ success: true, already_tracked: true });
+
+    await supabase.from("referrals").insert({
+      referrer_email:   referrer.email,
+      referrer_user_id: referrer.user_id,
+      referred_email,
+      referred_user_id,
+      status: "pending",
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /referral/reward — manually trigger referral reward (backup to webhook)
+app.post("/referral/reward", requireAuth, async (req, res) => {
+  try {
+    const { data: referral } = await supabase.from("referrals")
+      .select("*").eq("referred_user_id", req.user.id).eq("status", "pending").single();
+    if (!referral) return res.json({ success: true, no_referral: true });
+    await processReferralReward(referral);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── WHITE LABEL ─────────────────────────────────────────────────────────────
+
+// GET /whitelabel/admin — must be before /:id or Express matches "admin" as an id
+app.get("/whitelabel/admin", requireAuth, async (req, res) => {
+  const email = req.user.email;
+  if (!email) return res.status(400).json({ success: false, error: "Authenticated email required." });
+  try {
+    const { data: account, error } = await supabase.from("white_label_accounts")
+      .select("*")
+      .eq("owner_email", email)
+      .single();
+    if (error || !account) return res.status(404).json({ success: false, error: "No white label account found." });
+
+    const { count } = await supabase.from("sessions")
+      .select("*", { count: "exact", head: true })
+      .eq("white_label_id", account.id);
+
+    res.json({ success: true, account, session_count: count || 0 });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /whitelabel/domain/:domain — must be before /:id
+app.get("/whitelabel/domain/:domain", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("white_label_accounts")
+      .select("id, brand_name, brand_color, brand_logo_url, plan, active")
+      .eq("custom_domain", req.params.domain)
+      .eq("active", true)
+      .single();
+    if (error || !data) return res.status(404).json({ success: false, error: "Not found." });
+    res.json({ success: true, account: data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get("/whitelabel/:id", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("white_label_accounts")
+      .select("id, brand_name, brand_color, brand_logo_url, custom_domain, plan, active")
+      .eq("id", req.params.id)
+      .single();
+    if (error || !data) return res.status(404).json({ success: false, error: "White label account not found." });
+    res.json({ success: true, account: data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.put("/whitelabel/:id", requireAuth, async (req, res) => {
+  const email = req.user.email;
+  const { brand_name, brand_color, brand_logo_url, custom_domain } = req.body;
+  try {
+    const { data: existing } = await supabase.from("white_label_accounts")
+      .select("id")
+      .eq("id", req.params.id)
+      .eq("owner_email", email)
+      .single();
+    if (!existing) return res.status(403).json({ success: false, error: "Not authorized." });
+
+    const updates = {};
+    if (brand_name     !== undefined) updates.brand_name     = brand_name;
+    if (brand_color    !== undefined) updates.brand_color    = brand_color;
+    if (brand_logo_url !== undefined) updates.brand_logo_url = brand_logo_url;
+    if (custom_domain  !== undefined) updates.custom_domain  = custom_domain;
+
+    const { data, error } = await supabase.from("white_label_accounts")
+      .update(updates).eq("id", req.params.id).select().single();
+    if (error) throw new Error(error.message);
+    res.json({ success: true, account: data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post("/whitelabel/register", async (req, res) => {
+  const { brand_name, brand_color, brand_logo_url, custom_domain, plan, email } = req.body;
+  if (!brand_name || !plan || !email) {
+    return res.status(400).json({ success: false, error: "brand_name, plan, and email are required." });
+  }
+  const priceMap = {
+    basic:        process.env.WL_PRICE_BASIC,
+    professional: process.env.WL_PRICE_PROFESSIONAL,
+    enterprise:   process.env.WL_PRICE_ENTERPRISE,
+  };
+  const priceId = priceMap[plan];
+  if (!priceId) return res.status(400).json({ success: false, error: "Invalid plan or pricing not configured." });
+
+  try {
+    const { data: account, error } = await supabase.from("white_label_accounts").insert({
+      owner_email:    email,
+      brand_name,
+      brand_color:    brand_color    || "#a8d8c8",
+      brand_logo_url: brand_logo_url || null,
+      custom_domain:  custom_domain  || null,
+      plan,
+      active: false,
+    }).select().single();
+    if (error) throw new Error(error.message);
+
+    const session = await stripeClient.checkout.sessions.create({
+      payment_method_types: ["card"],
+      mode: "subscription",
+      customer_email: email,
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: `${APP_URL}/whitelabel?registered=true&wl_id=${account.id}`,
+      cancel_url:  `${APP_URL}/whitelabel`,
+      metadata: { type: "whitelabel", wl_id: account.id, plan },
+    });
+
+    res.json({ success: true, checkoutUrl: session.url, wl_id: account.id });
+  } catch (err) {
+    console.error("WL register error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post("/corporate-inquiry", async (req, res) => {
+  const { name, email, company, role, teamSize, useCase, timeline, message } = req.body;
+  if (!name || !email || !company) {
+    return res.status(400).json({ success: false, error: "Name, email, and company are required." });
+  }
+  const resend = getResendClient();
+  if (!resend) return res.status(500).json({ success: false, error: "Email service unavailable." });
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: "support@mindtranceform.com",
+      subject: `Corporate inquiry — ${company} (${name})`,
+      html: emailWrap(
+        h(`Corporate Inquiry: ${company}`) +
+        p(`<strong style="color:#e8e6f0;">Name:</strong> ${name}`) +
+        p(`<strong style="color:#e8e6f0;">Email:</strong> ${email}`) +
+        p(`<strong style="color:#e8e6f0;">Company:</strong> ${company}`) +
+        (role     ? p(`<strong style="color:#e8e6f0;">Role:</strong> ${role}`)                    : "") +
+        (teamSize ? p(`<strong style="color:#e8e6f0;">Team size:</strong> ${teamSize}`)            : "") +
+        (useCase  ? p(`<strong style="color:#e8e6f0;">Use case:</strong> ${useCase}`)             : "") +
+        (timeline ? p(`<strong style="color:#e8e6f0;">Timeline:</strong> ${timeline}`)            : "") +
+        (message  ? p(`<strong style="color:#e8e6f0;">Message:</strong><br>${message}`)           : "")
+      ),
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── TESTIMONIALS ────────────────────────────────────────────────────────────
+
+app.post("/testimonial", requireAuth, async (req, res) => {
+  const { user_name, program, rating, message } = req.body;
+  if (!rating || rating < 1 || rating > 5) {
+    return res.status(400).json({ success: false, error: "rating (1–5) required." });
+  }
+  try {
+    await supabase.from("testimonials").insert({
+      user_id:    req.user.id,
+      user_email: req.user.email || null,
+      user_name:  user_name || "Anonymous",
+      program:    program   || null,
+      rating,
+      message:    message   || null,
+      approved:   false,
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get("/testimonials", async (_req, res) => {
+  const { data, error } = await supabase.from("testimonials")
+    .select("id, user_name, program, rating, message, created_at")
+    .eq("approved", true)
+    .order("created_at", { ascending: false })
+    .limit(6);
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true, testimonials: data || [] });
+});
+
+app.get("/admin/testimonials", requireAdmin, async (_req, res) => {
+  const { data, error } = await supabase.from("testimonials")
+    .select("*")
+    .order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true, testimonials: data || [] });
+});
+
+app.put("/admin/testimonials/:id/approve", requireAdmin, async (req, res) => {
+  const { error } = await supabase.from("testimonials")
+    .update({ approved: true }).eq("id", req.params.id);
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true });
+});
+
 app.listen(PORT, () => {
   console.log(`Mind Tranceform backend running on port ${PORT}`);
   console.log(`ElevenLabs key loaded: ${process.env.ELEVENLABS_API_KEY ? "YES" : "MISSING"}`);
-  console.log(`Resend key loaded: ${process.env.RESEND_API_KEY ? "YES" : "MISSING"}`);
+  console.log(`Resend key loaded:     ${process.env.RESEND_API_KEY ? "YES" : "MISSING"}`);
+  console.log(`Email FROM address:    ${FROM}`);
+  console.log(`App URL:               ${APP_URL}`);
+  console.log(`Stripe key mode:       ${(process.env.STRIPE_SECRET_KEY || "").startsWith("sk_live") ? "LIVE" : (process.env.STRIPE_SECRET_KEY || "").startsWith("sk_test") ? "TEST" : "MISSING"}`);
 });
