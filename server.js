@@ -17,7 +17,7 @@ function getResendClient() {
   return new Resend(process.env.RESEND_API_KEY);
 }
 
-const FROM = process.env.RESEND_FROM_EMAIL || "Mind Tranceform <noreply@mindtranceformapp.com>";
+const FROM = "Mind Tranceform <noreply@mindtranceformapp.com>";
 const APP_URL = process.env.APP_URL || "https://app.mindtranceformapp.com";
 
 const app = express();
