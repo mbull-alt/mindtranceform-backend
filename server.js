@@ -343,7 +343,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     try {
       const audioResponse = await axios.post(
         `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-        { text: script, model_id: "eleven_turbo_v2_5", voice_settings: { stability: 0.6, similarity_boost: 0.8 } },
+        { text: script, model_id: "eleven_multilingual_v2", speed: 0.75, voice_settings: { stability: 0.85, similarity_boost: 0.75, style: 0.15, use_speaker_boost: false } },
         { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer" }
       );
       audioBase64 = Buffer.from(audioResponse.data).toString("base64");
@@ -429,8 +429,9 @@ app.get("/preview-voice/:voiceName", async (req, res) => {
       `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
       {
         text: "Take a deep breath... and relax. This is what your personalized session will sound like.",
-        model_id: "eleven_turbo_v2_5",
-        voice_settings: { stability: 0.6, similarity_boost: 0.8 },
+        model_id: "eleven_multilingual_v2",
+        speed: 0.75,
+        voice_settings: { stability: 0.85, similarity_boost: 0.75, style: 0.15, use_speaker_boost: false },
       },
       { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer" }
     );
@@ -449,7 +450,7 @@ app.get("/test-elevenlabs", async (_req, res) => {
   try {
     const r = await axios.post(
       "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM",
-      { text: "Test.", model_id: "eleven_turbo_v2_5", voice_settings: { stability: 0.6, similarity_boost: 0.8 } },
+      { text: "Test.", model_id: "eleven_multilingual_v2", speed: 0.75, voice_settings: { stability: 0.85, similarity_boost: 0.75, style: 0.15, use_speaker_boost: false } },
       { headers: { "xi-api-key": key, "Content-Type": "application/json" }, responseType: "arraybuffer" }
     );
     res.json({ ok: true, keyPrefix: key.slice(0, 10) + "...", bytesReceived: r.data.byteLength });
@@ -528,7 +529,14 @@ Voice style: ${voice || "Female Calm"}
 Background sound: ${background || "432 Hz"}
 Session style: ${style || "Gentle Meditation"}${deepContext}
 
-Rules:
+Pacing & formatting rules (critical — this is for text-to-speech audio at a slow meditation pace):
+- Write with very short sentences and frequent paragraph breaks.
+- Add "..." at the end of every sentence to indicate a pause.
+- Write slowly paced content — fewer words per minute than normal speech.
+- Include explicit pause instructions between major sections, such as: "Take a slow breath in... and out..."
+- Target approximately 100 words per minute of audio at a slow meditation pace (${wordTarget - 50}–${wordTarget + 50} total words for this session).
+
+Content rules:
 1. Use ${name}'s name at least 4 times throughout.
 2. Write in second person.
 3. Begin with 3 slow breathing instructions.
@@ -539,8 +547,7 @@ ${deepContext ? "8" : "7"}. Include 3 personalized affirmations tied directly to
 ${deepContext ? "9" : "8"}. ${endings[program] || "End positively."}
 ${deepContext ? "10" : "9"}. Style: ${styleGuides[style] || styleGuides["Gentle Meditation"]}
 ${deepContext ? "11" : "10"}. Background: ${intensityGuides[backgroundIntensity] || intensityGuides["Balanced"]}
-${deepContext ? "12" : "11"}. ${wordTarget - 50}–${wordTarget + 50} words. Use "..." for natural pauses.
-${deepContext ? "13" : "12"}. Output ONLY the script. No titles, labels, or commentary.`;
+${deepContext ? "12" : "11"}. Output ONLY the script. No titles, labels, or commentary.`;
 }
 
 // ─── AUTH VERIFY ─────────────────────────────────────────────────────────────
