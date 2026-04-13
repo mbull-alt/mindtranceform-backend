@@ -53,13 +53,17 @@ function requireAdmin(req, res, next) {
 }
 
 // ─── VOICE MAP ───────────────────────────────────────────────────────────────
+// Default IDs are well-known ElevenLabs library voices.
+// Override any slot via the corresponding environment variable in Render.
 const VOICE_MAP = {
-  "Female Calm":   process.env.ELEVENLABS_VOICE_FEMALE_CALM   || "21m00Tcm4TlvDq8ikWAM",
-  "Female Warm":   process.env.ELEVENLABS_VOICE_FEMALE_WARM   || "EXAVITQu4vr4xnSDxMaL",
-  "Male Calm":     process.env.ELEVENLABS_VOICE_MALE_CALM     || "TxGEqnHWrfWFTfGW9XjX",
-  "Male Deep":     process.env.ELEVENLABS_VOICE_MALE_DEEP     || "VR6AewLTigWG4xSOukaG",
-  "Male Smooth":   process.env.ELEVENLABS_VOICE_MALE_SMOOTH   || "pNInz6obpgDQGcFmaJgB",
-  "Male Resonant": process.env.ELEVENLABS_VOICE_MALE_RESONANT || "yoZ06aMxZJJ28mfd3POQ",
+  "Female Calm":        process.env.ELEVENLABS_VOICE_FEMALE_CALM    || "21m00Tcm4TlvDq8ikWAM", // Rachel
+  "Female Warm":        process.env.ELEVENLABS_VOICE_FEMALE_WARM    || "EXAVITQu4vr4xnSDxMaL", // Bella
+  "Female Whisper":     process.env.ELEVENLABS_VOICE_FEMALE_WHISPER || "ThT5KcBeYPX3keUQqHPh", // Dorothy
+  "Female British":     process.env.ELEVENLABS_VOICE_FEMALE_BRITISH || "XB0fDUnXU5powFXDhCwa", // Charlotte
+  "Male Calm":          process.env.ELEVENLABS_VOICE_MALE_CALM      || "GBv7mTt0atIp3Br8iCZE", // Thomas
+  "Male Deep Hypnosis": process.env.ELEVENLABS_VOICE_MALE_DEEP      || "VR6AewLTigWG4xSOukaG", // Arnold
+  "Male Warm":          process.env.ELEVENLABS_VOICE_MALE_WARM      || "pNInz6obpgDQGcFmaJgB", // Adam
+  "Male British":       process.env.ELEVENLABS_VOICE_MALE_BRITISH   || "N2lVS1w4EtoT3dr4eOWO", // Callum
 };
 
 // ─── EMAIL HELPERS ────────────────────────────────────────────────────────────
@@ -421,18 +425,21 @@ app.post("/cron/email-sequences", async (req, res) => {
   }
 });
 
+const PREVIEW_TEXT = "Take a slow deep breath... and relax...";
+const PREVIEW_SETTINGS = {
+  model_id: "eleven_multilingual_v2",
+  speed: 0.75,
+  voice_settings: { stability: 0.85, similarity_boost: 0.75, style: 0.15, use_speaker_boost: false },
+};
+
+// GET /preview-voice/:voiceName — returns audio/mpeg stream (used by the app)
 app.get("/preview-voice/:voiceName", async (req, res) => {
   const voiceId = VOICE_MAP[req.params.voiceName];
   if (!voiceId) return res.status(400).json({ error: "Unknown voice" });
   try {
     const r = await axios.post(
       `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-      {
-        text: "Take a deep breath... and relax. This is what your personalized session will sound like.",
-        model_id: "eleven_multilingual_v2",
-        speed: 0.75,
-        voice_settings: { stability: 0.85, similarity_boost: 0.75, style: 0.15, use_speaker_boost: false },
-      },
+      { text: PREVIEW_TEXT, ...PREVIEW_SETTINGS },
       { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer" }
     );
     res.set("Content-Type", "audio/mpeg");
@@ -441,6 +448,24 @@ app.get("/preview-voice/:voiceName", async (req, res) => {
   } catch (err) {
     const status = err?.response?.status || 500;
     res.status(status).json({ error: "Preview unavailable" });
+  }
+});
+
+// POST /preview-voice — takes { voice } in body, returns { audioBase64 }
+app.post("/preview-voice", async (req, res) => {
+  const { voice } = req.body || {};
+  const voiceId = VOICE_MAP[voice];
+  if (!voiceId) return res.status(400).json({ success: false, error: "Unknown voice" });
+  try {
+    const r = await axios.post(
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+      { text: PREVIEW_TEXT, ...PREVIEW_SETTINGS },
+      { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer" }
+    );
+    res.json({ success: true, audioBase64: Buffer.from(r.data).toString("base64") });
+  } catch (err) {
+    const status = err?.response?.status || 500;
+    res.status(status).json({ success: false, error: "Preview unavailable" });
   }
 });
 
