@@ -4,6 +4,10 @@ const dotenv = require("dotenv");
 const axios = require("axios");
 const stripe = require("stripe");
 const { createClient } = require("@supabase/supabase-js");
+const { exec } = require("child_process");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 dotenv.config();
 
 const supabase = createClient(
@@ -284,6 +288,52 @@ function cleanScriptForTTS(script) {
     .trim();
 }
 
+// ─── AUDIO TEMPO ─────────────────────────────────────────────────────────────
+// Slow the ElevenLabs audio buffer to `tempo` (0.75 = 75% speed) using
+// ffmpeg's atempo filter, which preserves pitch. Falls back to the original
+// buffer if ffmpeg is unavailable or fails.
+function slowDownAudio(inputBuffer, tempo = 0.75) {
+  return new Promise((resolve) => {
+    const tag = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const inputPath  = path.join(os.tmpdir(), `tts_in_${tag}.mp3`);
+    const outputPath = path.join(os.tmpdir(), `tts_out_${tag}.mp3`);
+
+    const cleanup = () => {
+      try { fs.unlinkSync(inputPath);  } catch {}
+      try { fs.unlinkSync(outputPath); } catch {}
+    };
+
+    try {
+      fs.writeFileSync(inputPath, inputBuffer);
+    } catch (err) {
+      console.warn("[audio] could not write temp file for ffmpeg:", err.message);
+      return resolve(inputBuffer);
+    }
+
+    exec(
+      `ffmpeg -i "${inputPath}" -filter:a "atempo=${tempo}" -y "${outputPath}"`,
+      { timeout: 60000 },
+      (err) => {
+        if (err) {
+          console.warn("[audio] ffmpeg atempo failed — returning original audio:", err.message);
+          cleanup();
+          return resolve(inputBuffer);
+        }
+        try {
+          const slowed = fs.readFileSync(outputPath);
+          cleanup();
+          console.log(`[audio] ffmpeg atempo=${tempo} applied — ${inputBuffer.length} → ${slowed.length} bytes`);
+          resolve(slowed);
+        } catch (readErr) {
+          console.warn("[audio] could not read ffmpeg output:", readErr.message);
+          cleanup();
+          resolve(inputBuffer);
+        }
+      }
+    );
+  });
+}
+
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => {
   res.json({ message: "Mind Tranceform backend is running", status: "ok" });
@@ -384,12 +434,14 @@ app.post("/generate-session", requireAuth, async (req, res) => {
         {
           text: script,
           model_id: "eleven_multilingual_v2",
-          speed: 0.75,
           voice_settings: { stability: 0.90, similarity_boost: 0.75, style: 0.10, use_speaker_boost: false },
         },
         { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer" }
       );
-      audioBase64 = Buffer.from(audioResponse.data).toString("base64");
+      // Slow to 75% of original speed via ffmpeg atempo filter (pitch-preserving).
+      // Falls back to original audio if ffmpeg is unavailable.
+      const slowed = await slowDownAudio(Buffer.from(audioResponse.data), 0.75);
+      audioBase64 = slowed.toString("base64");
     } catch (audioErr) {
       console.error("ElevenLabs error:", audioErr?.response?.status || audioErr.message);
       audioUnavailable = true;
