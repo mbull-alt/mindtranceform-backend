@@ -264,6 +264,26 @@ async function sendSequenceEmail(userId, email, day) {
   }
 }
 
+// ─── SCRIPT CLEANING ─────────────────────────────────────────────────────────
+// Strip any stage directions the AI may have included before sending to ElevenLabs.
+// ElevenLabs reads parenthetical text aloud — we want none of it.
+function cleanScriptForTTS(script) {
+  return script
+    .replace(/\(pause\)/gi, "  ")
+    .replace(/\(breathe\)/gi, "  ")
+    .replace(/\(slow breath\)/gi, "  ")
+    .replace(/\(exhale\)/gi, "  ")
+    .replace(/\(inhale\)/gi, "  ")
+    // Generic catch-all: remove any remaining (stage direction) patterns
+    .replace(/\([^)]{1,40}\)/g, "  ")
+    // Collapse runs of 3+ spaces down to two (ElevenLabs treats 2 spaces as a brief pause)
+    .replace(/ {3,}/g, "  ")
+    // Remove lines that are now blank or only whitespace after stripping
+    .replace(/^\s*[\r\n]/gm, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => {
   res.json({ message: "Mind Tranceform backend is running", status: "ok" });
@@ -350,8 +370,10 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       { model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens, temperature: 0.85 },
       { headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" } }
     );
-    const script = aiResponse.data.choices[0]?.message?.content?.trim();
-    if (!script) throw new Error("No script returned from AI.");
+    const rawScript = aiResponse.data.choices[0]?.message?.content?.trim();
+    if (!rawScript) throw new Error("No script returned from AI.");
+    // Strip any stage directions the AI may have written before sending to ElevenLabs
+    const script = cleanScriptForTTS(rawScript);
 
     const voiceId = VOICE_MAP[voice] || VOICE_MAP["Female Calm"];
     let audioBase64 = null;
@@ -359,7 +381,12 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     try {
       const audioResponse = await axios.post(
         `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-        { text: script, model_id: "eleven_multilingual_v2", speed: 0.75, voice_settings: { stability: 0.85, similarity_boost: 0.75, style: 0.15, use_speaker_boost: false } },
+        {
+          text: script,
+          model_id: "eleven_multilingual_v2",
+          speed: 0.75,
+          voice_settings: { stability: 0.90, similarity_boost: 0.75, style: 0.10, use_speaker_boost: false },
+        },
         { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer" }
       );
       audioBase64 = Buffer.from(audioResponse.data).toString("base64");
@@ -441,7 +468,7 @@ const PREVIEW_TEXT = "Take a slow deep breath... and relax...";
 const PREVIEW_SETTINGS = {
   model_id: "eleven_multilingual_v2",
   speed: 0.75,
-  voice_settings: { stability: 0.85, similarity_boost: 0.75, style: 0.15, use_speaker_boost: false },
+  voice_settings: { stability: 0.90, similarity_boost: 0.75, style: 0.10, use_speaker_boost: false },
 };
 
 // GET /preview-voice/:voiceName — returns audio/mpeg stream (used by the app)
@@ -566,13 +593,12 @@ Voice style: ${voice || "Female Calm"}
 Background sound: ${background || "432 Hz"}
 Session style: ${style || "Gentle Meditation"}${deepContext}
 
-Pacing & formatting rules (critical — this is for text-to-speech audio at a very slow meditation pace):
-- Write with very short sentences and frequent paragraph breaks.
-- Add "..." at the end of EVERY single sentence without exception.
-- Add "(pause)" on its own line between every paragraph.
-- Add "(breathe)" before each new section heading or major transition.
-- Write extremely slowly paced content — 80 words per minute maximum.
-- Include explicit slow breathing instructions between every major section: "Take a slow breath in... hold... and breathe out slowly..."
+Pacing & formatting rules (critical — this is for text-to-speech audio at a slow meditation pace):
+- Write in long, slow, flowing sentences with natural breath points built in.
+- Use gentle, hypnotic rhythm — avoid short, clipped sentences.
+- Add "..." at the end of every sentence to signal a natural pause.
+- Write breathing instructions as spoken words within the text, for example: "Take a slow breath in... and as you breathe out... let everything soften..."
+- Do NOT use any stage directions, labels, or parenthetical instructions like (pause), (breathe), (inhale), (exhale), or similar — these will be read aloud.
 - Target approximately 80 words per minute of audio at a slow meditation pace (${wordTarget - 50}–${wordTarget + 50} total words for this session).
 
 Content rules:
