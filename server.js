@@ -566,12 +566,14 @@ Voice style: ${voice || "Female Calm"}
 Background sound: ${background || "432 Hz"}
 Session style: ${style || "Gentle Meditation"}${deepContext}
 
-Pacing & formatting rules (critical — this is for text-to-speech audio at a slow meditation pace):
+Pacing & formatting rules (critical — this is for text-to-speech audio at a very slow meditation pace):
 - Write with very short sentences and frequent paragraph breaks.
-- Add "..." at the end of every sentence to indicate a pause.
-- Write slowly paced content — fewer words per minute than normal speech.
-- Include explicit pause instructions between major sections, such as: "Take a slow breath in... and out..."
-- Target approximately 100 words per minute of audio at a slow meditation pace (${wordTarget - 50}–${wordTarget + 50} total words for this session).
+- Add "..." at the end of EVERY single sentence without exception.
+- Add "(pause)" on its own line between every paragraph.
+- Add "(breathe)" before each new section heading or major transition.
+- Write extremely slowly paced content — 80 words per minute maximum.
+- Include explicit slow breathing instructions between every major section: "Take a slow breath in... hold... and breathe out slowly..."
+- Target approximately 80 words per minute of audio at a slow meditation pace (${wordTarget - 50}–${wordTarget + 50} total words for this session).
 
 Content rules:
 1. Use ${name}'s name at least 4 times throughout.
