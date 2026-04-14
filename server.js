@@ -117,19 +117,30 @@ async function hasEmailBeenSent(userId, type) {
   return data?.length > 0;
 }
 
+// In-memory lock: prevents duplicate sends when /user/register fires concurrently
+const _emailInProgress = new Set();
+
 // ─── EMAIL SENDERS ────────────────────────────────────────────────────────────
 async function sendWelcomeEmail(userId, email) {
-  console.log(`[email] sendWelcomeEmail → userId=${userId} to=${email} from=${FROM}`);
-  if (await hasEmailBeenSent(userId, "seq_day0")) {
-    console.log(`[email] welcome already logged for ${email} — skipping`);
+  const lockKey = `${userId}:seq_day0`;
+  if (_emailInProgress.has(lockKey)) {
+    console.log(`[email] welcome send already in progress for ${email} — skipping`);
     return;
   }
-  const resend = getResendClient();
-  if (!resend) {
-    console.warn("[email] RESEND_API_KEY not set — skipping welcome email");
-    return;
-  }
+  _emailInProgress.add(lockKey);
   try {
+    console.log(`[email] sendWelcomeEmail → userId=${userId} to=${email} from=${FROM}`);
+    if (await hasEmailBeenSent(userId, "seq_day0")) {
+      console.log(`[email] welcome already logged for ${email} — skipping`);
+      return;
+    }
+    const resend = getResendClient();
+    if (!resend) {
+      console.warn("[email] RESEND_API_KEY not set — skipping welcome email");
+      return;
+    }
+    // Log BEFORE sending — prevents a second concurrent call from passing the DB check
+    await logEmail(userId, email, "seq_day0");
     const result = await resend.emails.send({
       from: FROM,
       to: email,
@@ -142,9 +153,10 @@ async function sendWelcomeEmail(userId, email) {
       ),
     });
     console.log(`[email] welcome sent ✓ to=${email} id=${result?.data?.id ?? JSON.stringify(result)}`);
-    await logEmail(userId, email, "seq_day0");
   } catch (err) {
     console.error(`[email] welcome FAILED to=${email} — ${err?.message}`, err?.response?.data ?? err);
+  } finally {
+    _emailInProgress.delete(lockKey);
   }
 }
 
@@ -1115,6 +1127,20 @@ app.put("/admin/testimonials/:id/approve", requireAdmin, async (req, res) => {
     .update({ approved: true }).eq("id", req.params.id);
   if (error) return res.status(500).json({ success: false, error: error.message });
   res.json({ success: true });
+});
+
+app.post("/admin/grant-access", requireAdmin, async (req, res) => {
+  const { email, plan } = req.body;
+  if (!email || !plan) {
+    return res.status(400).json({ success: false, error: "email and plan are required" });
+  }
+  const { error } = await supabase.from("user_profiles").update({
+    plan,
+    is_subscriber: true,
+    subscription_status: "active",
+  }).eq("email", email);
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true, message: `Granted ${plan} access to ${email}` });
 });
 
 app.listen(PORT, () => {
