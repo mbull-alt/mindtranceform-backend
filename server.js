@@ -10,6 +10,8 @@ const os = require("os");
 const path = require("path");
 dotenv.config();
 
+const { runDailyContentGeneration, runDailyOutreach, runWeeklyContentGeneration } = require("./contentEngine");
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -194,13 +196,16 @@ async function sendSessionDeliveryEmail(email, { name, program, voice, script })
   }
 }
 
-async function sendSequenceEmail(userId, email, day) {
+async function sendSequenceEmail(userId, email, day, name = "") {
   const type = `seq_day${day}`;
   if (await hasEmailBeenSent(userId, type)) return false;
 
+  const hi   = name ? `, ${name}` : "";
+  const hey  = name ? `${name}, ` : "";
+
   const emails = {
     1: {
-      subject: "Did you try your session yet?",
+      subject: `How did your session feel${hi}?`,
       html: emailWrap(
         h("How does it actually feel?") +
         p("People describe their first Mind Tranceform session as something they didn't expect:") +
@@ -208,45 +213,59 @@ async function sendSequenceEmail(userId, email, day) {
           "Like someone finally wrote something just for me. Not a generic script — my name, my goal, my voice. I listened twice."
         </div>` +
         p("It's not a generic guided meditation. It uses your name, your specific goal, and the voice tone you choose. The AI writes it, speaks it, and saves it so you can come back anytime.") +
-        cta("Try It Now ✦", APP_URL)
+        cta("Open My Session ✦", APP_URL)
       ),
     },
     3: {
-      subject: "Your personalized session is waiting (2 min to create)",
+      subject: `${hey}your mind responds to what is personal`,
       html: emailWrap(
-        h("Still thinking about it?") +
-        p("Here's exactly what happens when you click Generate:") +
+        h("Generic advice doesn't reach you. Personal does.") +
+        p("There's a reason most meditation apps don't stick. They speak to everyone — which means they speak to no one.") +
+        p("Mind Tranceform is different. Here's exactly what happens when you click Generate:") +
         `<ul style="color:#c8c5d8;font-size:15px;line-height:2;padding-left:20px;margin:0 0 16px;">
-          <li>AI writes a script using your name and your exact goal</li>
+          <li>AI writes a script using <em>your</em> name and <em>your</em> exact goal</li>
           <li>ElevenLabs voices it in the tone you chose</li>
-          <li>Your complete session is ready in under 60 seconds</li>
-          <li>It's saved to your account — listen anytime</li>
+          <li>Your session is ready in under 60 seconds</li>
+          <li>It's saved — listen anytime, anywhere</li>
         </ul>` +
         p("Two minutes. Your name. Your goal. Your voice.") +
         cta("Generate My Session ✦", APP_URL)
       ),
     },
     7: {
-      subject: "Last reminder — your free session",
+      subject: `One week ago you started something${hi}`,
       html: emailWrap(
-        h("This is our last reminder") +
-        p("Your free session is still waiting. After today we'll stop nudging you — but it'll be there whenever you're ready.") +
-        p("One session. Two minutes. Completely personalized to you.") +
-        `<div style="background:rgba(168,216,200,0.06);border:0.5px solid rgba(168,216,200,0.2);border-radius:10px;padding:16px 20px;margin:0 0 8px;font-size:13px;color:#8a879e;line-height:1.7;">
-          ✦ &nbsp;Sleep · Stress &amp; Anxiety · Abundance<br>
-          Choose your program, your voice, your background sound.
+        h("Seven days ago, you took a step.") +
+        p("You signed up because something in you knew you needed a change — more sleep, less anxiety, a clearer mind, or something you're working toward.") +
+        p("That goal is still there. And so is your free session.") +
+        `<div style="background:rgba(168,216,200,0.06);border:0.5px solid rgba(168,216,200,0.2);border-radius:10px;padding:16px 20px;margin:0 0 16px;font-size:13px;color:#8a879e;line-height:1.7;">
+          People who listen to their personalized session consistently report results within 7–14 days. Not from one listen — from returning to something that was made for them.
         </div>` +
-        cta("Create It Now ✦", APP_URL)
+        p("Upgrade to Premium and unlock unlimited sessions, every program, and longer session lengths. Your first month is the hardest. After that, it becomes a habit.") +
+        cta("Unlock Premium ✦", `${APP_URL}?upgrade=1`)
       ),
     },
     14: {
-      subject: "We made something new for you",
+      subject: `We made something new for you${hi}`,
       html: emailWrap(
         h("Something worth coming back for") +
-        p("Since you signed up, we've improved our Sleep, Stress &amp; Anxiety, and Abundance sessions — deeper personalization, better voice quality, richer audio layering.") +
-        p("This isn't a reminder. It's a new version of something we think you'll actually want to try.") +
-        p("Come see what's changed.") +
+        p("Since you signed up, we've deepened the personalization engine — sessions now respond to more of what makes you, you.") +
+        p("New programs. Better voice quality. Richer audio layering. Deeper hypnotic suggestion patterns.") +
+        p("This isn't a reminder. It's a new version of something we think you'll genuinely want to experience.") +
         cta("Try the New Sessions ✦", APP_URL)
+      ),
+    },
+    30: {
+      subject: `Still thinking about you${hi}`,
+      html: emailWrap(
+        h("We don't do many of these.") +
+        p("This is the last email we'll send for a while. Not because we're giving up on you — but because we respect that timing is personal.") +
+        p("If life got busy, we get it. If the moment didn't feel right, we get that too.") +
+        p("Whenever you're ready — your free session is still there. It takes two minutes. It uses your name, your goal, your voice. Nothing has changed except the day.") +
+        `<div style="background:rgba(168,216,200,0.06);border:0.5px solid rgba(168,216,200,0.2);border-radius:10px;padding:16px 20px;margin:0 0 16px;text-align:center;font-size:14px;color:#c8c5d8;line-height:1.8;">
+          ✦ &nbsp;Your session is personalized to you.<br>No one else has one like it.
+        </div>` +
+        cta("Create My Session ✦", APP_URL)
       ),
     },
   };
@@ -259,8 +278,11 @@ async function sendSequenceEmail(userId, email, day) {
   console.log(`[email] sendSequenceEmail day=${day} → to=${email} from=${FROM}`);
   try {
     const result = await resend.emails.send({ from: FROM, to: email, ...emailData });
-    console.log(`[email] sequence day=${day} sent ✓ to=${email} id=${result?.data?.id ?? JSON.stringify(result)}`);
+    const resendId = result?.data?.id || null;
+    console.log(`[email] sequence day=${day} sent ✓ to=${email} id=${resendId}`);
     await logEmail(userId, email, type);
+    // Track in email_events for webhook matching
+    supabase.from("email_events").insert({ user_id: userId, email, email_type: type, event_type: "sent", resend_email_id: resendId }).catch(() => {});
     return true;
   } catch (err) {
     console.error(`[email] sequence day=${day} FAILED to=${email} — ${err?.message}`, err?.response?.data ?? err);
@@ -447,6 +469,11 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       audioUnavailable = true;
     }
 
+    // Persist user's first name for personalised emails
+    if (req.user.id && name) {
+      supabase.from("user_profiles").update({ name }).eq("user_id", req.user.id).catch(() => {});
+    }
+
     await supabase.from("sessions").insert({
       id: Date.now().toString(),
       user_id: req.user.id,
@@ -484,7 +511,7 @@ app.post("/cron/email-sequences", async (req, res) => {
   try {
     const { data: profiles } = await supabase
       .from("user_profiles")
-      .select("user_id, email, created_at")
+      .select("user_id, email, name, created_at")
       .eq("is_subscriber", false);
 
     if (!profiles?.length) return res.json({ success: true, processed: 0 });
@@ -492,10 +519,11 @@ app.post("/cron/email-sequences", async (req, res) => {
     const now = Date.now();
     let sent = 0;
     const SEQUENCE = [
-      { day: 1,  ms: 1  * 24 * 60 * 60 * 1000 },
-      { day: 3,  ms: 3  * 24 * 60 * 60 * 1000 },
-      { day: 7,  ms: 7  * 24 * 60 * 60 * 1000 },
+      { day: 1,  ms:  1 * 24 * 60 * 60 * 1000 },
+      { day: 3,  ms:  3 * 24 * 60 * 60 * 1000 },
+      { day: 7,  ms:  7 * 24 * 60 * 60 * 1000 },
       { day: 14, ms: 14 * 24 * 60 * 60 * 1000 },
+      { day: 30, ms: 30 * 24 * 60 * 60 * 1000 },
     ];
 
     for (const profile of profiles) {
@@ -503,7 +531,7 @@ app.post("/cron/email-sequences", async (req, res) => {
       const elapsed = now - signedUpAt;
       for (const { day, ms } of SEQUENCE) {
         if (elapsed >= ms) {
-          const didSend = await sendSequenceEmail(profile.user_id, profile.email, day);
+          const didSend = await sendSequenceEmail(profile.user_id, profile.email, day, profile.name || "");
           if (didSend) sent++;
         }
       }
@@ -1221,6 +1249,145 @@ app.post("/admin/grant-access", requireAdmin, async (req, res) => {
   }).eq("email", email);
   if (error) return res.status(500).json({ success: false, error: error.message });
   res.json({ success: true, message: `Granted ${plan} access to ${email}` });
+});
+
+// ─── CONTENT CALENDAR ADMIN ──────────────────────────────────────────────────
+app.get("/admin/content", requireAdmin, async (req, res) => {
+  const { type, status, limit = 100 } = req.query;
+  let q = supabase.from("content_calendar").select("*").order("generated_at", { ascending: false }).limit(Number(limit));
+  if (type)   q = q.eq("type", type);
+  if (status) q = q.eq("status", status);
+  const { data, error } = await q;
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true, items: data || [] });
+});
+
+app.put("/admin/content/:id/status", requireAdmin, async (req, res) => {
+  const { status } = req.body;
+  const validStatuses = ["draft", "approved", "posted"];
+  if (!validStatuses.includes(status)) return res.status(400).json({ success: false, error: "Invalid status" });
+  const update = { status };
+  if (status === "posted") update.posted_at = new Date().toISOString();
+  const { error } = await supabase.from("content_calendar").update(update).eq("id", req.params.id);
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true });
+});
+
+// ─── BLOG ────────────────────────────────────────────────────────────────────
+app.get("/blog/posts", async (req, res) => {
+  const { data, error } = await supabase
+    .from("blog_posts")
+    .select("id, title, slug, excerpt, topic, published_at, created_at")
+    .eq("status", "published")
+    .order("published_at", { ascending: false })
+    .limit(20);
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true, posts: data || [] });
+});
+
+app.get("/blog/posts/:slug", async (req, res) => {
+  const { data, error } = await supabase
+    .from("blog_posts")
+    .select("*")
+    .eq("slug", req.params.slug)
+    .eq("status", "published")
+    .single();
+  if (error || !data) return res.status(404).json({ success: false, error: "Post not found" });
+  res.json({ success: true, post: data });
+});
+
+app.post("/admin/blog/generate", requireAdmin, async (req, res) => {
+  try {
+    const result = await require("./contentEngine").generateBlogPost();
+    if (!result) return res.status(500).json({ success: false, error: "Generation failed" });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.put("/admin/blog/:id/publish", requireAdmin, async (req, res) => {
+  const { error } = await supabase
+    .from("blog_posts")
+    .update({ status: "published", published_at: new Date().toISOString() })
+    .eq("id", req.params.id);
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true });
+});
+
+app.get("/admin/blog", requireAdmin, async (_req, res) => {
+  const { data, error } = await supabase
+    .from("blog_posts")
+    .select("id, title, slug, topic, status, created_at, published_at")
+    .order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true, posts: data || [] });
+});
+
+// ─── CONTENT CRON ENDPOINTS ──────────────────────────────────────────────────
+function verifyCron(req, res) {
+  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) {
+    res.status(401).json({ error: "Unauthorized" });
+    return false;
+  }
+  return true;
+}
+
+app.post("/cron/daily-content", async (req, res) => {
+  if (!verifyCron(req, res)) return;
+  try {
+    const summary = await runDailyContentGeneration();
+    res.json({ success: true, ...summary });
+  } catch (err) {
+    console.error("Cron daily-content error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post("/cron/daily-outreach", async (req, res) => {
+  if (!verifyCron(req, res)) return;
+  try {
+    const summary = await runDailyOutreach();
+    res.json({ success: true, ...summary });
+  } catch (err) {
+    console.error("Cron daily-outreach error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post("/cron/weekly-content", async (req, res) => {
+  if (!verifyCron(req, res)) return;
+  try {
+    const summary = await runWeeklyContentGeneration();
+    res.json({ success: true, ...summary });
+  } catch (err) {
+    console.error("Cron weekly-content error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── RESEND WEBHOOK (email open/click tracking) ───────────────────────────────
+app.post("/webhook/resend", express.json(), async (req, res) => {
+  try {
+    const { type, data } = req.body || {};
+    if (!type || !data) return res.json({ received: true });
+
+    // type examples: "email.opened", "email.clicked", "email.bounced", "email.complained"
+    const eventType = type.replace("email.", ""); // "opened", "clicked", etc.
+    const resendId  = data.email_id || null;
+
+    if (resendId) {
+      await supabase.from("email_events").insert({
+        event_type: eventType,
+        resend_email_id: resendId,
+        metadata: data,
+      });
+    }
+    res.json({ received: true });
+  } catch (err) {
+    console.error("[webhook/resend]", err.message);
+    res.json({ received: true }); // always 200 to Resend
+  }
 });
 
 app.listen(PORT, () => {
