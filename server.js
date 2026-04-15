@@ -50,12 +50,20 @@ async function requireAuth(req, res, next) {
   next();
 }
 
-function requireAdmin(req, res, next) {
-  const key = process.env.ADMIN_KEY;
-  if (!key || req.headers["x-admin-key"] !== key) {
-    return res.status(401).json({ error: "Unauthorized" });
+async function requireAdmin(req, res, next) {
+  // Legacy x-admin-key support (cron jobs, CLI)
+  const adminKey = process.env.ADMIN_KEY;
+  if (adminKey && req.headers["x-admin-key"] === adminKey) return next();
+
+  // JWT-based: accept any logged-in user whose email matches ADMIN_EMAIL
+  const adminEmail = process.env.ADMIN_EMAIL;
+  const token = req.headers.authorization?.replace("Bearer ", "");
+  if (adminEmail && token) {
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (!error && user?.email === adminEmail) return next();
   }
-  next();
+
+  return res.status(401).json({ error: "Unauthorized" });
 }
 
 // ─── VOICE MAP ───────────────────────────────────────────────────────────────
