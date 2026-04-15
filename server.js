@@ -1263,7 +1263,7 @@ app.post("/admin/grant-access", requireAdmin, async (req, res) => {
 app.get("/admin/content", requireAdmin, async (req, res) => {
   const { type, status, limit = 100 } = req.query;
   console.log(`[admin/content] GET type=${type||"all"} status=${status||"all"} limit=${limit}`);
-  let q = supabase.from("content_calendar").select("*").order("created_at", { ascending: false }).limit(Number(limit));
+  let q = supabase.from("content_calendar").select("*").order("generated_at", { ascending: false }).limit(Number(limit));
   if (type)   q = q.eq("type", type);
   if (status) q = q.eq("status", status);
   const { data, error } = await q;
