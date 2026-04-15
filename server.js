@@ -1254,11 +1254,16 @@ app.post("/admin/grant-access", requireAdmin, async (req, res) => {
 // ─── CONTENT CALENDAR ADMIN ──────────────────────────────────────────────────
 app.get("/admin/content", requireAdmin, async (req, res) => {
   const { type, status, limit = 100 } = req.query;
-  let q = supabase.from("content_calendar").select("*").order("generated_at", { ascending: false }).limit(Number(limit));
+  console.log(`[admin/content] GET type=${type||"all"} status=${status||"all"} limit=${limit}`);
+  let q = supabase.from("content_calendar").select("*").order("created_at", { ascending: false }).limit(Number(limit));
   if (type)   q = q.eq("type", type);
   if (status) q = q.eq("status", status);
   const { data, error } = await q;
-  if (error) return res.status(500).json({ success: false, error: error.message });
+  if (error) {
+    console.error("[admin/content] Supabase query error:", error.message, error.code);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+  console.log(`[admin/content] returning ${(data||[]).length} items`);
   res.json({ success: true, items: data || [] });
 });
 

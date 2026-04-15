@@ -41,9 +41,21 @@ async function openai(prompt, maxTokens = 700) {
 
 // ─── SAVE TO SUPABASE ────────────────────────────────────────────────────────
 async function saveContent(items) {
-  if (!items.length) return;
-  const { error } = await supabase.from("content_calendar").insert(items);
-  if (error) console.error("[content] Supabase insert error:", error.message);
+  if (!items.length) {
+    console.log("[content] saveContent: no items to save");
+    return;
+  }
+  const now = new Date().toISOString();
+  const stamped = items.map(item => ({ ...item, generated_at: now }));
+  console.log(`[content] saveContent: inserting ${stamped.length} items into content_calendar`);
+  console.log("[content] SUPABASE_URL set:", !!process.env.SUPABASE_URL);
+  console.log("[content] SERVICE_ROLE_KEY set:", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
+  const { data, error } = await supabase.from("content_calendar").insert(stamped).select("id");
+  if (error) {
+    console.error("[content] Supabase insert error:", error.message, "code:", error.code, "details:", error.details);
+    throw new Error(`Supabase insert failed: ${error.message}`);
+  }
+  console.log(`[content] saveContent: inserted ${(data||[]).length} rows successfully`);
 }
 
 function tomorrowAt(hour) {
@@ -370,14 +382,31 @@ Write the full post.`,
 
 async function runDailyContentGeneration() {
   console.log("[content] Daily generation starting...");
-  const [tiktok, twitter, reddit, email] = await Promise.all([
-    generateTikTokScripts(),
-    generateTwitterPosts(),
-    generateRedditPost(),
-    generateEmailSubjectLines(),
-  ]);
+  console.log("[content] OPENAI_API_KEY set:", !!process.env.OPENAI_API_KEY);
+  console.log("[content] SUPABASE_URL set:", !!process.env.SUPABASE_URL);
+  console.log("[content] SUPABASE_SERVICE_ROLE_KEY set:", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+  console.log("[content] Generating TikTok scripts...");
+  const tiktok = await generateTikTokScripts();
+  console.log(`[content] TikTok: ${tiktok.length} items`);
+
+  console.log("[content] Generating Twitter posts...");
+  const twitter = await generateTwitterPosts();
+  console.log(`[content] Twitter: ${twitter.length} items`);
+
+  console.log("[content] Generating Reddit post...");
+  const reddit = await generateRedditPost();
+  console.log(`[content] Reddit: ${reddit.length} items`);
+
+  console.log("[content] Generating email subject lines...");
+  const email = await generateEmailSubjectLines();
+  console.log(`[content] Email: ${email.length} items`);
+
   const all = [...tiktok, ...twitter, ...reddit, ...email];
+  console.log(`[content] Total items to save: ${all.length}`);
+
   await saveContent(all);
+
   const summary = { tiktok: tiktok.length, twitter: twitter.length, reddit: reddit.length, email: email.length, total: all.length };
   console.log("[content] Daily generation done:", summary);
   return summary;
