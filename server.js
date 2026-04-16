@@ -290,7 +290,10 @@ async function sendSequenceEmail(userId, email, day, name = "") {
     console.log(`[email] sequence day=${day} sent ✓ to=${email} id=${resendId}`);
     await logEmail(userId, email, type);
     // Track in email_events for webhook matching
-    supabase.from("email_events").insert({ user_id: userId, email, email_type: type, event_type: "sent", resend_email_id: resendId }).catch(() => {});
+    (async () => {
+      const { error } = await supabase.from("email_events").insert({ user_id: userId, email, email_type: type, event_type: "sent", resend_email_id: resendId });
+      if (error) console.error("[email_events] insert:", error.message);
+    })();
     return true;
   } catch (err) {
     console.error(`[email] sequence day=${day} FAILED to=${email} — ${err?.message}`, err?.response?.data ?? err);
@@ -477,9 +480,12 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       audioUnavailable = true;
     }
 
-    // Persist user's first name for personalised emails
+    // Persist user's first name for personalised emails (fire-and-forget)
     if (req.user.id && name) {
-      supabase.from("user_profiles").update({ name }).eq("user_id", req.user.id).catch(() => {});
+      (async () => {
+        const { error } = await supabase.from("user_profiles").update({ name }).eq("user_id", req.user.id);
+        if (error) console.error("[user_profiles] update name:", error.message);
+      })();
     }
 
     await supabase.from("sessions").insert({
