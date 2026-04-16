@@ -302,20 +302,24 @@ async function sendSequenceEmail(userId, email, day, name = "") {
 }
 
 // ─── SCRIPT CLEANING ─────────────────────────────────────────────────────────
-// Strip any stage directions the AI may have included before sending to ElevenLabs.
-// ElevenLabs reads parenthetical text aloud — we want none of it.
+// Strip stage directions and fix formatting before sending to ElevenLabs.
+// SSML <break time="Xs"/> tags are intentional and must be preserved — they
+// are the only reliable pause mechanism with eleven_multilingual_v2.
 function cleanScriptForTTS(script) {
   return script
-    .replace(/\(pause\)/gi, "  ")
-    .replace(/\(breathe\)/gi, "  ")
-    .replace(/\(slow breath\)/gi, "  ")
-    .replace(/\(exhale\)/gi, "  ")
-    .replace(/\(inhale\)/gi, "  ")
-    // Generic catch-all: remove any remaining (stage direction) patterns
-    .replace(/\([^)]{1,40}\)/g, "  ")
-    // Collapse runs of 3+ spaces down to two (ElevenLabs treats 2 spaces as a brief pause)
-    .replace(/ {3,}/g, "  ")
-    // Remove lines that are now blank or only whitespace after stripping
+    // Remove parenthetical stage directions — ElevenLabs reads them aloud
+    .replace(/\(pause\)/gi, " ")
+    .replace(/\(breathe\)/gi, " ")
+    .replace(/\(slow breath\)/gi, " ")
+    .replace(/\(exhale\)/gi, " ")
+    .replace(/\(inhale\)/gi, " ")
+    .replace(/\([^)]{1,60}\)/g, " ")
+    // Convert any stray dot-sequences (4+ dots) the AI may still generate into
+    // a 1.5s break tag so pauses are never lost even if the prompt is ignored
+    .replace(/\.{4,}/g, ' <break time="1.5s"/> ')
+    // Collapse runs of 3+ spaces to a single space
+    .replace(/ {3,}/g, " ")
+    // Tidy up blank lines
     .replace(/^\s*[\r\n]/gm, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
@@ -472,10 +476,11 @@ app.post("/generate-session", requireAuth, async (req, res) => {
         },
         { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer" }
       );
-      // Additional post-processing via ffmpeg atempo (pitch-preserving).
-      // Combined with speed: 0.70 above this produces a very calm, slow delivery.
-      // Falls back to original audio if ffmpeg is unavailable.
-      const slowed = await slowDownAudio(Buffer.from(audioResponse.data), 0.75);
+      // Post-processing via ffmpeg atempo at 0.65 (pitch-preserving).
+      // Combined with ElevenLabs speed: 0.70 and SSML <break> pauses this
+      // produces a very slow, calm delivery. Falls back to original if ffmpeg
+      // is unavailable.
+      const slowed = await slowDownAudio(Buffer.from(audioResponse.data), 0.65);
       audioBase64 = slowed.toString("base64");
     } catch (audioErr) {
       console.error("ElevenLabs error:", audioErr?.response?.status || audioErr.message);
@@ -691,35 +696,36 @@ Session style: ${style || "Gentle Meditation"}${deepContext}
 
 DELIVERY STYLE — read this carefully, it controls how the audio will sound:
 Write as if speaking to someone who is already half asleep. Every word should be slow, soft, and unhurried. Use long vowel sounds and flowing sentences. Never use sharp or abrupt language.
-Use these slow speech patterns throughout: "slowly... and gently...", "allow yourself to...", "feel yourself...", "notice how...", "with every breath...", "deeper and deeper..."
+Use these slow speech patterns throughout: "slowly, and gently", "allow yourself to", "feel yourself", "notice how", "with every breath", "deeper and deeper"
 Write in long, flowing sentences with multiple commas creating natural breath points — not short clipped sentences.
 Add a blank line between every single sentence.
 Target approximately 60 words per minute — very slow and deliberate (${wordTarget - 50}–${wordTarget + 50} total words).
 
-PAUSE NOTATION — use exactly these dot counts, never plain "...":
-- Between every sentence: "......" (6 dots — 1 second pause)
-- After breathing instructions: "..............." (15 dots — 3 second pause)
-- Between major sections: ".........." (10 dots — 2 second pause)
-- After each countdown number line: "............" (12 dots — 2.5 second pause)
-- After each affirmation: "........." (9 dots — 2 second pause)
-Every pause should feel generous. When in doubt, use more dots not fewer.
+PAUSE NOTATION — use SSML break tags for every pause. Do NOT use dots or ellipses for pauses — they will be read aloud or ignored. Use only these tags:
+- Between every sentence: <break time="1.5s"/>
+- After breathing instructions: <break time="3.5s"/>
+- Between major sections: <break time="2.5s"/>
+- After each countdown number: <break time="4s"/>
+- After each affirmation: <break time="2.5s"/>
+Every pause should feel generous. When in doubt use a longer break time.
 
-BREATHING INSTRUCTION FORMAT — write the opening breathing section exactly like this pattern:
-"Breathe in, slowly, through your nose............... and hold it gently............... now breathe out, slowly, through your mouth............... feel your body soften and relax with every breath.........."
+BREATHING INSTRUCTION FORMAT — write the opening breathing section exactly like this:
+Breathe in, slowly, through your nose <break time="4s"/> and hold it gently <break time="3s"/> now breathe out, slowly, through your mouth <break time="4s"/> feel your body sink deeper into relaxation <break time="3s"/>
 
-COUNTDOWN FORMAT — write the countdown exactly like this pattern:
-"Ten............... allow yourself to sink deeper..............
-Nine............... deeper still..............
-Eight............... more relaxed with every number..............
-Seven............... letting go of everything now..............
-Six............... peaceful and still..............
-Five............... halfway there, sinking beautifully..............
-Four............... deeper with every word..............
-Three............... almost completely at rest..............
-Two............... so deeply relaxed now..............
-One............... completely, beautifully still.........."
+COUNTDOWN FORMAT — write the countdown exactly like this:
+Ten <break time="4s"/> allow yourself to sink deeper <break time="3s"/>
+Nine <break time="4s"/> deeper still <break time="3s"/>
+Eight <break time="4s"/> more relaxed with every number <break time="3s"/>
+Seven <break time="4s"/> letting go of everything now <break time="3s"/>
+Six <break time="4s"/> peaceful and still <break time="3s"/>
+Five <break time="4s"/> halfway there, sinking beautifully <break time="3s"/>
+Four <break time="4s"/> deeper with every word <break time="3s"/>
+Three <break time="4s"/> almost completely at rest <break time="3s"/>
+Two <break time="4s"/> so deeply relaxed now <break time="3s"/>
+One <break time="4s"/> completely, beautifully still <break time="3s"/>
 
 Do NOT use any stage directions, labels, or parenthetical instructions like (pause), (breathe), (inhale), (exhale) — these will be read aloud verbatim.
+Do NOT use dots or ellipses (...) anywhere — they are not parsed as pauses by the voice engine. Use only the <break> tags above.
 
 Content rules:
 1. Use ${name}'s name at least 4 times throughout.
