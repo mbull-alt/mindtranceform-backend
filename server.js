@@ -459,8 +459,15 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     );
     const rawScript = aiResponse.data.choices[0]?.message?.content?.trim();
     if (!rawScript) throw new Error("No script returned from AI.");
-    // Strip any stage directions the AI may have written before sending to ElevenLabs
-    const script = cleanScriptForTTS(rawScript);
+
+    // ssmlScript — retains <break> tags for ElevenLabs audio generation
+    const ssmlScript = cleanScriptForTTS(rawScript);
+
+    // cleanScript — all XML/SSML tags stripped; used for display, storage, email
+    const cleanScript = ssmlScript
+      .replace(/<[^>]*>/g, " ")   // remove every <tag>
+      .replace(/\s{2,}/g, " ")    // collapse multiple spaces
+      .trim();
 
     const voiceId = VOICE_MAP[voice] || VOICE_MAP["Female Calm"];
     let audioBase64 = null;
@@ -469,7 +476,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       const audioResponse = await axios.post(
         `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
         {
-          text: script,
+          text: ssmlScript,  // SSML version — ElevenLabs parses <break> tags
           model_id: "eleven_multilingual_v2",
           speed: 0.70,
           voice_settings: { stability: 0.95, similarity_boost: 0.70, style: 0.05, use_speaker_boost: false },
@@ -500,7 +507,8 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       user_id: req.user.id,
       email: req.user.email || null,
       title: `${program} — ${style || "Gentle Meditation"} — ${mins} min`,
-      program, voice, background, script,
+      program, voice, background,
+      script: cleanScript,        // clean version saved to DB
       audio_base64: audioBase64,
       white_label_id: white_label_id || null,
     });
@@ -512,10 +520,10 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       .range(10, 1000);
     if (old?.length) await supabase.from("sessions").delete().in("id", old.map((s) => s.id));
 
-    // Send session delivery email (fire-and-forget)
-    sendSessionDeliveryEmail(req.user.email, { name, program, voice, script }).catch(console.error);
+    // Send session delivery email (fire-and-forget) — clean script only
+    sendSessionDeliveryEmail(req.user.email, { name, program, voice, script: cleanScript }).catch(console.error);
 
-    return res.json({ success: true, script, audioBase64, audioUnavailable });
+    return res.json({ success: true, script: cleanScript, audioBase64, audioUnavailable });
   } catch (err) {
     const message = err?.response?.data?.error?.message || err.message || "Generation failed.";
     console.error("Generation error:", message);
