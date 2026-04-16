@@ -70,12 +70,12 @@ async function requireAdmin(req, res, next) {
 // Default IDs are well-known ElevenLabs library voices.
 // Override any slot via the corresponding environment variable in Render.
 const VOICE_MAP = {
-  "Female Calm":        process.env.ELEVENLABS_VOICE_FEMALE_CALM    || "21m00Tcm4TlvDq8ikWAM", // Rachel
+  "Female Calm":        process.env.ELEVENLABS_VOICE_FEMALE_CALM    || "XrExE9yKIg1WjnnlVkGX", // Matilda — naturally slow and warm
   "Female Warm":        process.env.ELEVENLABS_VOICE_FEMALE_WARM    || "EXAVITQu4vr4xnSDxMaL", // Bella
   "Female Whisper":     process.env.ELEVENLABS_VOICE_FEMALE_WHISPER || "ThT5KcBeYPX3keUQqHPh", // Dorothy
   "Female British":     process.env.ELEVENLABS_VOICE_FEMALE_BRITISH || "XB0fDUnXU5powFXDhCwa", // Charlotte
-  "Male Calm":          process.env.ELEVENLABS_VOICE_MALE_CALM      || "GBv7mTt0atIp3Br8iCZE", // Thomas
-  "Male Deep Hypnosis": process.env.ELEVENLABS_VOICE_MALE_DEEP      || "VR6AewLTigWG4xSOukaG", // Arnold
+  "Male Calm":          process.env.ELEVENLABS_VOICE_MALE_CALM      || "onwK4e9ZLuTAKqWW03F9", // Daniel — calm British
+  "Male Deep Hypnosis": process.env.ELEVENLABS_VOICE_MALE_DEEP      || "N2lVS1w4EtoT3dr4eOWO", // Callum — slow and measured
   "Male Warm":          process.env.ELEVENLABS_VOICE_MALE_WARM      || "pNInz6obpgDQGcFmaJgB", // Adam
   "Male British":       process.env.ELEVENLABS_VOICE_MALE_BRITISH   || "N2lVS1w4EtoT3dr4eOWO", // Callum
 };
@@ -467,11 +467,13 @@ app.post("/generate-session", requireAuth, async (req, res) => {
         {
           text: script,
           model_id: "eleven_multilingual_v2",
-          voice_settings: { stability: 0.90, similarity_boost: 0.75, style: 0.10, use_speaker_boost: false },
+          speed: 0.70,
+          voice_settings: { stability: 0.95, similarity_boost: 0.70, style: 0.05, use_speaker_boost: false },
         },
         { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer" }
       );
-      // Slow to 75% of original speed via ffmpeg atempo filter (pitch-preserving).
+      // Additional post-processing via ffmpeg atempo (pitch-preserving).
+      // Combined with speed: 0.70 above this produces a very calm, slow delivery.
       // Falls back to original audio if ffmpeg is unavailable.
       const slowed = await slowDownAudio(Buffer.from(audioResponse.data), 0.75);
       audioBase64 = slowed.toString("base64");
@@ -558,11 +560,11 @@ app.post("/cron/email-sequences", async (req, res) => {
   }
 });
 
-const PREVIEW_TEXT = "Take a slow deep breath... and relax...";
+const PREVIEW_TEXT = "Take a slow, deep breath in............... and breathe out, slowly............... allow yourself to relax..........";
 const PREVIEW_SETTINGS = {
   model_id: "eleven_multilingual_v2",
-  speed: 0.75,
-  voice_settings: { stability: 0.90, similarity_boost: 0.75, style: 0.10, use_speaker_boost: false },
+  speed: 0.70,
+  voice_settings: { stability: 0.95, similarity_boost: 0.70, style: 0.05, use_speaker_boost: false },
 };
 
 // GET /preview-voice/:voiceName — returns audio/mpeg stream (used by the app)
@@ -687,20 +689,44 @@ Voice style: ${voice || "Female Calm"}
 Background sound: ${background || "432 Hz"}
 Session style: ${style || "Gentle Meditation"}${deepContext}
 
-Pacing & formatting rules (critical — this is for text-to-speech audio at a slow meditation pace):
-- Write in long, slow, flowing sentences with natural breath points built in.
-- Use gentle, hypnotic rhythm — avoid short, clipped sentences.
-- Add "..." at the end of every sentence to signal a natural pause.
-- Write breathing instructions as spoken words within the text, for example: "Take a slow breath in... and as you breathe out... let everything soften..."
-- Do NOT use any stage directions, labels, or parenthetical instructions like (pause), (breathe), (inhale), (exhale), or similar — these will be read aloud.
-- Target approximately 80 words per minute of audio at a slow meditation pace (${wordTarget - 50}–${wordTarget + 50} total words for this session).
+DELIVERY STYLE — read this carefully, it controls how the audio will sound:
+Write as if speaking to someone who is already half asleep. Every word should be slow, soft, and unhurried. Use long vowel sounds and flowing sentences. Never use sharp or abrupt language.
+Use these slow speech patterns throughout: "slowly... and gently...", "allow yourself to...", "feel yourself...", "notice how...", "with every breath...", "deeper and deeper..."
+Write in long, flowing sentences with multiple commas creating natural breath points — not short clipped sentences.
+Add a blank line between every single sentence.
+Target approximately 60 words per minute — very slow and deliberate (${wordTarget - 50}–${wordTarget + 50} total words).
+
+PAUSE NOTATION — use exactly these dot counts, never plain "...":
+- Between every sentence: "......" (6 dots — 1 second pause)
+- After breathing instructions: "..............." (15 dots — 3 second pause)
+- Between major sections: ".........." (10 dots — 2 second pause)
+- After each countdown number line: "............" (12 dots — 2.5 second pause)
+- After each affirmation: "........." (9 dots — 2 second pause)
+Every pause should feel generous. When in doubt, use more dots not fewer.
+
+BREATHING INSTRUCTION FORMAT — write the opening breathing section exactly like this pattern:
+"Breathe in, slowly, through your nose............... and hold it gently............... now breathe out, slowly, through your mouth............... feel your body soften and relax with every breath.........."
+
+COUNTDOWN FORMAT — write the countdown exactly like this pattern:
+"Ten............... allow yourself to sink deeper..............
+Nine............... deeper still..............
+Eight............... more relaxed with every number..............
+Seven............... letting go of everything now..............
+Six............... peaceful and still..............
+Five............... halfway there, sinking beautifully..............
+Four............... deeper with every word..............
+Three............... almost completely at rest..............
+Two............... so deeply relaxed now..............
+One............... completely, beautifully still.........."
+
+Do NOT use any stage directions, labels, or parenthetical instructions like (pause), (breathe), (inhale), (exhale) — these will be read aloud verbatim.
 
 Content rules:
 1. Use ${name}'s name at least 4 times throughout.
 2. Write in second person.
-3. Begin with 3 slow breathing instructions.
+3. Begin with 3 slow breathing instructions using the breathing format above.
 4. Include a body scan relaxation from head to toe.
-5. Countdown from 10 to 1 to deepen the state.
+5. Countdown from 10 to 1 using the countdown format above.
 6. Weave "${goal}" into vivid positive suggestions and visualization.${deepContext ? "\n7. Incorporate the deep personalization details naturally into the script." : ""}
 ${deepContext ? "8" : "7"}. Include 3 personalized affirmations tied directly to their goal. ${affirmGuides[affirmationStyle] || affirmGuides["I am"]}
 ${deepContext ? "9" : "8"}. ${endings[program] || "End positively."}
