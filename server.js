@@ -693,7 +693,11 @@ app.get("/sessions/:id", requireAuth, async (req, res) => {
     .eq("user_id", req.user.id)
     .eq("id", req.params.id)
     .single();
-  if (error || !data) return res.status(404).json({ success: false, error: "Session not found." });
+  if (error || !data) {
+    console.error("[session/:id] Not found or error:", error?.message, "id:", req.params.id);
+    return res.status(404).json({ success: false, error: "Session not found." });
+  }
+  console.log(`[session/:id] Found session ${req.params.id}, audio_base64 length: ${data.audio_base64?.length || 0}`);
   const { audio_base64, ...rest } = data;
   res.json({ success: true, session: { ...rest, audioBase64: audio_base64 } });
 });
