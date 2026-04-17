@@ -687,19 +687,45 @@ app.get("/sessions", requireAuth, async (req, res) => {
 });
 
 app.get("/sessions/:id", requireAuth, async (req, res) => {
+  // Excludes audio_base64 — audio is served separately via /sessions/:id/audio
   const { data, error } = await supabase
     .from("sessions")
-    .select("*")
+    .select("id, title, program, voice, background, script, created_at, white_label_id")
     .eq("user_id", req.user.id)
     .eq("id", req.params.id)
     .single();
   if (error || !data) {
-    console.error("[session/:id] Not found or error:", error?.message, "id:", req.params.id);
+    console.error("[session/:id] Not found:", error?.message, "id:", req.params.id);
     return res.status(404).json({ success: false, error: "Session not found." });
   }
-  console.log(`[session/:id] Found session ${req.params.id}, audio_base64 length: ${data.audio_base64?.length || 0}`);
-  const { audio_base64, ...rest } = data;
-  res.json({ success: true, session: { ...rest, audioBase64: audio_base64 } });
+  res.json({ success: true, session: data });
+});
+
+// Streams audio for a session as binary audio/mpeg.
+// Accepts JWT via Authorization header OR ?token= query param so the
+// <audio> element can use it directly as a src URL.
+app.get("/sessions/:id/audio", async (req, res) => {
+  const token = req.headers.authorization?.replace("Bearer ", "") || req.query.token;
+  if (!token) return res.status(401).send("Unauthorized");
+  const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
+  if (authErr || !user) return res.status(401).send("Unauthorized");
+
+  const { data, error } = await supabase
+    .from("sessions")
+    .select("audio_base64")
+    .eq("user_id", user.id)
+    .eq("id", req.params.id)
+    .single();
+
+  if (error || !data) return res.status(404).send("Session not found");
+  if (!data.audio_base64) return res.status(404).send("No audio for this session");
+
+  console.log(`[session/:id/audio] Serving audio for ${req.params.id}, size: ${data.audio_base64.length} chars`);
+  const buf = Buffer.from(data.audio_base64, "base64");
+  res.set("Content-Type", "audio/mpeg");
+  res.set("Content-Length", buf.length);
+  res.set("Cache-Control", "private, max-age=3600");
+  res.send(buf);
 });
 
 // ─── PROMPT ───────────────────────────────────────────────────────────────────
