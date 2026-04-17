@@ -531,9 +531,11 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       })();
     }
 
-    console.log(`[session] Saving session for user ${req.user.id} (${req.user.email})`);
+    console.log(`[session] Audio size: ${audioBase64?.length || 0} chars, unavailable: ${audioUnavailable}`);
+    const sessionId = Date.now().toString();
+    console.log(`[session] Saving session ${sessionId} for user ${req.user.id} (${req.user.email})`);
     const { error: insertError } = await supabase.from("sessions").insert({
-      id: Date.now().toString(),
+      id: sessionId,
       user_id: req.user.id,
       email: req.user.email || null,
       title: `${program} — ${style || "Gentle Meditation"} — ${mins} min`,
@@ -559,7 +561,10 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     // Send session delivery email (fire-and-forget) — clean script only
     sendSessionDeliveryEmail(req.user.email, { name, program, voice, script: cleanScript }).catch(console.error);
 
-    return res.json({ success: true, script: cleanScript, audioBase64, audioUnavailable });
+    // Return sessionId so the frontend can stream audio from /sessions/:id/audio
+    // Do NOT return audioBase64 in the JSON — 5-10MB base64 inside JSON is too large
+    // to parse reliably in the browser and causes the result screen to show unavailable.
+    return res.json({ success: true, script: cleanScript, sessionId, audioUnavailable });
   } catch (err) {
     const message = err?.response?.data?.error?.message || err.message || "Generation failed.";
     console.error("Generation error:", message);
@@ -671,29 +676,60 @@ app.get("/test-elevenlabs", async (_req, res) => {
 });
 
 app.get("/sessions", requireAuth, async (req, res) => {
-  console.log(`[sessions] Fetching sessions for user ${req.user.id} (${req.user.email})`);
-  const { data, error } = await supabase
+  console.log(`[sessions] Fetching sessions for user_id=${req.user.id} email=${req.user.email}`);
+
+  // Primary query: by user_id
+  let { data, error } = await supabase
     .from("sessions")
     .select("id, title, program, voice, background, created_at")
     .eq("user_id", req.user.id)
     .order("created_at", { ascending: false })
-    .limit(10);
+    .limit(20);
+
   if (error) {
-    console.error("[sessions] Fetch failed:", error.message, "code:", error.code);
+    console.error("[sessions] user_id query failed:", error.message);
     return res.status(500).json({ success: false, error: error.message });
   }
-  console.log(`[sessions] Returned ${data?.length || 0} sessions`);
+
+  // Fallback: if nothing found by user_id, try email (covers sessions saved before auth was stable)
+  if ((!data || data.length === 0) && req.user.email) {
+    console.log("[sessions] No results by user_id — trying email fallback");
+    const fallback = await supabase
+      .from("sessions")
+      .select("id, title, program, voice, background, created_at")
+      .eq("email", req.user.email)
+      .order("created_at", { ascending: false })
+      .limit(20);
+    if (!fallback.error && fallback.data?.length) {
+      data = fallback.data;
+      console.log(`[sessions] Email fallback returned ${data.length} sessions`);
+    }
+  }
+
+  console.log(`[sessions] Returning ${data?.length || 0} sessions`);
   res.json({ success: true, sessions: data || [] });
 });
 
 app.get("/sessions/:id", requireAuth, async (req, res) => {
   // Excludes audio_base64 — audio is served separately via /sessions/:id/audio
-  const { data, error } = await supabase
+  let { data, error } = await supabase
     .from("sessions")
     .select("id, title, program, voice, background, script, created_at, white_label_id")
     .eq("user_id", req.user.id)
     .eq("id", req.params.id)
     .single();
+
+  // Email fallback for sessions saved before user_id was reliable
+  if ((error || !data) && req.user.email) {
+    const fb = await supabase
+      .from("sessions")
+      .select("id, title, program, voice, background, script, created_at, white_label_id")
+      .eq("email", req.user.email)
+      .eq("id", req.params.id)
+      .single();
+    if (!fb.error && fb.data) { data = fb.data; error = null; }
+  }
+
   if (error || !data) {
     console.error("[session/:id] Not found:", error?.message, "id:", req.params.id);
     return res.status(404).json({ success: false, error: "Session not found." });
@@ -710,12 +746,23 @@ app.get("/sessions/:id/audio", async (req, res) => {
   const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
   if (authErr || !user) return res.status(401).send("Unauthorized");
 
-  const { data, error } = await supabase
+  let { data, error } = await supabase
     .from("sessions")
     .select("audio_base64")
     .eq("user_id", user.id)
     .eq("id", req.params.id)
     .single();
+
+  // Email fallback
+  if ((error || !data) && user.email) {
+    const fb = await supabase
+      .from("sessions")
+      .select("audio_base64")
+      .eq("email", user.email)
+      .eq("id", req.params.id)
+      .single();
+    if (!fb.error && fb.data) { data = fb.data; error = null; }
+  }
 
   if (error || !data) return res.status(404).send("Session not found");
   if (!data.audio_base64) return res.status(404).send("No audio for this session");
