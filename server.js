@@ -445,20 +445,45 @@ app.post("/verify-payment", async (req, res) => {
 });
 
 app.post("/generate-session", requireAuth, async (req, res) => {
-  const { name, goal, program, voice, background, length, style, personalization, fears, motivation, idealLife, affirmationStyle, backgroundIntensity, white_label_id } = req.body;
+  const { name, goal, program, voice, background, length, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, white_label_id } = req.body;
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
   const mins = parseInt(length) || 5;
-  const wordTarget = { 5: 450, 10: 900, 15: 1350, 20: 1800, 30: 2700 }[mins] || 450;
-  const maxTokens = Math.ceil(wordTarget * 1.5);
+  const wordTarget = { 5: 350, 10: 700, 15: 1050, 20: 1400, 30: 2100 }[mins] || 350;
+  const maxTokens = Math.ceil(wordTarget * 2.0);
   try {
-    const prompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, affirmationStyle, backgroundIntensity, wordTarget });
+    const prompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget });
     const aiResponse = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       { model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens, temperature: 0.85 },
       { headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" } }
     );
-    const rawScript = aiResponse.data.choices[0]?.message?.content?.trim();
+    let rawScript = aiResponse.data.choices[0]?.message?.content?.trim();
     if (!rawScript) throw new Error("No script returned from AI.");
+
+    // Check word count — if < 90% of target, request expansion
+    const wordCount = rawScript.replace(/<[^>]*>/g, "").trim().split(/\s+/).filter(Boolean).length;
+    console.log(`[session] Script word count: ${wordCount} (target: ${wordTarget})`);
+    if (wordCount < wordTarget * 0.9) {
+      console.log(`[session] Requesting expansion — ${wordCount} words vs ${wordTarget} target`);
+      const shortfall = wordTarget - wordCount;
+      const expandResponse = await axios.post(
+        "https://api.openai.com/v1/chat/completions",
+        {
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "user", content: prompt },
+            { role: "assistant", content: rawScript },
+            { role: "user", content: `This script is only ${wordCount} words but must be ${wordTarget} words. Expand it by approximately ${shortfall} words. Add more vivid imagery, longer breathing passages, deeper descriptions, and additional affirmations. Keep all existing SSML <break> tags. Return the complete expanded script only — no labels or commentary.` },
+          ],
+          max_tokens: Math.ceil(wordTarget * 2.5),
+          temperature: 0.85,
+        },
+        { headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" } }
+      );
+      rawScript = expandResponse.data.choices[0]?.message?.content?.trim() || rawScript;
+      const newCount = rawScript.replace(/<[^>]*>/g, "").trim().split(/\s+/).filter(Boolean).length;
+      console.log(`[session] Expanded word count: ${newCount}`);
+    }
 
     // ssmlScript — retains <break> tags for ElevenLabs audio generation
     const ssmlScript = cleanScriptForTTS(rawScript);
@@ -502,7 +527,8 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       })();
     }
 
-    await supabase.from("sessions").insert({
+    console.log(`[session] Saving session for user ${req.user.id} (${req.user.email})`);
+    const { error: insertError } = await supabase.from("sessions").insert({
       id: Date.now().toString(),
       user_id: req.user.id,
       email: req.user.email || null,
@@ -512,6 +538,8 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       audio_base64: audioBase64,
       white_label_id: white_label_id || null,
     });
+    if (insertError) console.error("[session] Insert failed:", insertError.message, insertError.code);
+    else console.log("[session] Session saved successfully");
 
     const { data: old } = await supabase
       .from("sessions").select("id")
@@ -658,7 +686,7 @@ app.get("/sessions/:id", requireAuth, async (req, res) => {
 });
 
 // ─── PROMPT ───────────────────────────────────────────────────────────────────
-function buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, affirmationStyle, backgroundIntensity, wordTarget = 450 }) {
+function buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget = 350 }) {
   const endings = {
     "Sleep":                "End with suggestions to drift into deep restful sleep. Do NOT include a wake-up.",
     "Stress & Anxiety":     "End with a calming positive anchor for the rest of the day.",
@@ -690,7 +718,12 @@ function buildPrompt({ name, goal, program, voice, background, style, personaliz
     "Immersive": "Weave the background sound throughout as an integral, living part of the experience.",
   };
 
-  const deepContext = personalization === "deep" && (fears || motivation || idealLife)
+  // Deep personalization: prefer the program-specific deepQ fields, fall back to legacy fears/motivation/idealLife
+  const hasDeepQ = personalization === "deep" && (deepQ1 || deepQ2 || deepQ3 || deepQ4);
+  const hasLegacy = personalization === "deep" && (fears || motivation || idealLife);
+  const deepContext = hasDeepQ
+    ? `\nDeep personalization:\n${deepQ1 ? `- ${deepQ1}` : ""}${deepQ2 ? `\n- ${deepQ2}` : ""}${deepQ3 ? `\n- ${deepQ3}` : ""}${deepQ4 ? `\n- ${deepQ4}` : ""}`.trim()
+    : hasLegacy
     ? `\nDeep personalization:\n${fears ? `- Fear / what to release: ${fears}` : ""}\n${motivation ? `- Core motivation: ${motivation}` : ""}\n${idealLife ? `- Ideal life vision: ${idealLife}` : ""}`.trim()
     : "";
 
@@ -707,7 +740,7 @@ Write as if speaking to someone who is already half asleep. Every word should be
 Use these slow speech patterns throughout: "slowly, and gently", "allow yourself to", "feel yourself", "notice how", "with every breath", "deeper and deeper"
 Write in long, flowing sentences with multiple commas creating natural breath points — not short clipped sentences.
 Add a blank line between every single sentence.
-Target approximately 60 words per minute — very slow and deliberate (${wordTarget - 50}–${wordTarget + 50} total words).
+This script MUST contain exactly ${wordTarget} words (±30). Count every spoken word — do not include SSML tags in the count. Do not stop early.
 
 PAUSE NOTATION — use SSML break tags for every pause. Do NOT use dots or ellipses for pauses — they will be read aloud or ignored. Use only these tags:
 - Between every sentence: <break time="1.5s"/>
