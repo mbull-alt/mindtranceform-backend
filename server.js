@@ -5,6 +5,7 @@ const axios = require("axios");
 const stripe = require("stripe");
 const { createClient } = require("@supabase/supabase-js");
 const { exec } = require("child_process");
+const { randomUUID } = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -501,25 +502,31 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     const voiceId = VOICE_MAP[voice] || VOICE_MAP["Female Calm"];
     let audioBase64 = null;
     let audioUnavailable = false;
+    const elevenPayload = {
+      text: ssmlScript,
+      model_id: "eleven_multilingual_v2",
+      voice_settings: { stability: 0.95, similarity_boost: 0.70, style: 0.05, use_speaker_boost: false },
+    };
+    console.log(`[elevenlabs] Sending to voice=${voiceId} payload preview: ${JSON.stringify(elevenPayload).slice(0, 1000)}`);
     try {
-      const audioResponse = await axios.post(
+      const elevenRes = await fetch(
         `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
         {
-          text: ssmlScript,  // SSML version — ElevenLabs parses <break> tags
-          model_id: "eleven_multilingual_v2",
-          speed: 0.70,
-          voice_settings: { stability: 0.95, similarity_boost: 0.70, style: 0.05, use_speaker_boost: false },
-        },
-        { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer" }
+          method: "POST",
+          headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
+          body: JSON.stringify(elevenPayload),
+        }
       );
-      // Post-processing via ffmpeg atempo at 0.65 (pitch-preserving).
-      // Combined with ElevenLabs speed: 0.70 and SSML <break> pauses this
-      // produces a very slow, calm delivery. Falls back to original if ffmpeg
-      // is unavailable.
-      const slowed = await slowDownAudio(Buffer.from(audioResponse.data), 0.65);
+      if (!elevenRes.ok) {
+        const errBody = await elevenRes.text();
+        console.error(`[elevenlabs] Error ${elevenRes.status}: ${errBody}`);
+        throw new Error(`ElevenLabs ${elevenRes.status}: ${errBody}`);
+      }
+      const arrayBuf = await elevenRes.arrayBuffer();
+      const slowed = await slowDownAudio(Buffer.from(arrayBuf), 0.65);
       audioBase64 = slowed.toString("base64");
     } catch (audioErr) {
-      console.error("ElevenLabs error:", audioErr?.response?.status || audioErr.message);
+      console.error(`[elevenlabs] Audio generation failed: ${audioErr.message}`);
       audioUnavailable = true;
     }
 
@@ -532,24 +539,25 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     }
 
     console.log(`[session] Audio size: ${audioBase64?.length || 0} chars, unavailable: ${audioUnavailable}`);
-    const sessionId = Date.now().toString();
-    console.log(`[session] Saving session ${sessionId} for user ${req.user.id} (${req.user.email})`);
-    const { error: insertError } = await supabase.from("sessions").insert({
-      id: sessionId,
+    const tentativeId = randomUUID();
+    console.log(`[session] Saving session for user ${req.user.id} (${req.user.email})`);
+    const { data: insertData, error: insertError } = await supabase.from("sessions").insert({
+      id: tentativeId,
       user_id: req.user.id,
       email: req.user.email || null,
       title: `${program} — ${style || "Gentle Meditation"} — ${mins} min`,
       program, voice, background,
       script: cleanScript,
       audio_base64: audioBase64,
-      white_label_id: white_label_id || null,
       created_at: new Date().toISOString(),
-    });
+    }).select("id").single();
     if (insertError) {
       console.error("[session] Insert failed:", insertError.message, "code:", insertError.code, "details:", insertError.details);
     } else {
-      console.log("[session] Session saved successfully");
+      console.log("[session] Session saved successfully — id:", insertData?.id || tentativeId);
     }
+    // Use the id returned by Supabase (handles auto-generated IDs) or fall back to tentativeId
+    const sessionId = insertData?.id || tentativeId;
 
     const { data: old } = await supabase
       .from("sessions").select("id")
