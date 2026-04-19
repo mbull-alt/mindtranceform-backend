@@ -450,7 +450,10 @@ app.post("/generate-session", requireAuth, async (req, res) => {
   console.log(`[generate] Received: name=${name}, program=${program}, length=${length}, style=${style}, personalization=${personalization}`);
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
   const mins = parseInt(length) || 5;
-  const wordTarget = { 5: 400, 10: 800, 15: 1200, 20: 1600, 30: 2400 }[mins] || 400;
+  // ElevenLabs hard limit is 10000 chars. At ~5 chars/word, cap word target at 1800 words (~9000 chars) to stay safe.
+  const ELEVENLABS_CHAR_LIMIT = 9800;
+  const rawWordTarget = { 5: 400, 10: 800, 15: 1200, 20: 1600, 30: 2400 }[mins] || 400;
+  const wordTarget = Math.min(rawWordTarget, Math.floor(ELEVENLABS_CHAR_LIMIT / 5));
   const maxTokens  = { 5: 600, 10: 1200, 15: 1800, 20: 2400, 30: 3600 }[mins] || 600;
   console.log(`[generate] mins=${mins}, wordTarget=${wordTarget}, maxTokens=${maxTokens}`);
   try {
@@ -502,8 +505,13 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     const voiceId = VOICE_MAP[voice] || VOICE_MAP["Female Calm"];
     let audioBase64 = null;
     let audioUnavailable = false;
+    // Hard truncation — ElevenLabs rejects requests over 10000 chars
+    const elevenLabsText = ssmlScript.length > ELEVENLABS_CHAR_LIMIT
+      ? ssmlScript.slice(0, ELEVENLABS_CHAR_LIMIT)
+      : ssmlScript;
+    console.log(`[elevenlabs] Script chars: ${ssmlScript.length}, sending: ${elevenLabsText.length}`);
     const elevenPayload = {
-      text: ssmlScript,
+      text: elevenLabsText,
       model_id: "eleven_multilingual_v2",
       voice_settings: { stability: 0.95, similarity_boost: 0.70, style: 0.05, use_speaker_boost: false },
     };
