@@ -446,21 +446,19 @@ app.post("/verify-payment", async (req, res) => {
 });
 
 app.post("/generate-session", requireAuth, async (req, res) => {
-  const { name, goal, program, voice, background, length, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, white_label_id } = req.body;
+  const { name, goal, program, voice, background, length, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity } = req.body;
   console.log(`[generate] Received: name=${name}, program=${program}, length=${length}, style=${style}, personalization=${personalization}`);
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
   const mins = parseInt(length) || 5;
-  // ElevenLabs hard limit is 10,000 chars. SSML break tags add ~2.5 chars per spoken word
-  // on top of ~5 chars/word, so the effective char cost is ~7.5 chars/word total.
-  // Word targets are calibrated for TTS at ~130 WPM slowed to 0.65× ≈ 85 WPM effective,
-  // plus SSML pause time. Staying under the char budget prevents mid-session truncation.
+  // wordTarget is the sole driver of script length — derived purely from the requested
+  // duration at 130 WPM (slowed TTS playback). The ElevenLabs char cap is a hard ceiling
+  // applied only at the moment of TTS submission and must never influence wordTarget.
   const ELEVENLABS_CHAR_LIMIT = 9800;
-  // wordTarget is derived purely from requested duration (130 WPM at slowed playback speed).
-  // The 9,800-char limit is a hard ceiling applied only when sending to ElevenLabs and must
-  // never be used to derive wordTarget — both are tracked independently.
   const wordTarget = mins * 130;
-  const maxTokens  = { 5: 600, 10: 1200, 15: 1800, 20: 2400, 30: 3600 }[mins] || 600;
-  console.log(`[generate] mins=${mins}, wordTarget=${wordTarget}, maxTokens=${maxTokens}, charBudget=${ELEVENLABS_CHAR_LIMIT}`);
+  // maxTokens must be large enough to generate the full wordTarget in one AI pass.
+  // Tokens ≈ words × 1.35 (English prose) + ~20 % overhead for SSML break tags.
+  const maxTokens = Math.ceil(wordTarget * 1.65);
+  console.log(`[generate] mins=${mins}, maxTokens=${maxTokens}`);
   try {
     const prompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins });
     const aiResponse = await axios.post(
@@ -508,14 +506,19 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       .replace(/\n{3,}/g, "\n\n")     // normalise to at most double newlines
       .trim();
 
+    // Log wordTarget and scriptCharCount as independent values.
+    // wordTarget must never be derived from or capped by scriptCharCount.
+    console.log(`wordTarget: ${wordTarget}`);
+    console.log(`scriptCharCount: ${ssmlScript.length}`);
+
     const voiceId = VOICE_MAP[voice] || VOICE_MAP["Female Calm"];
     let audioBase64 = null;
     let audioUnavailable = false;
-    // Hard truncation — ElevenLabs rejects requests over 10000 chars
+    // Hard truncation — applied only when sending to ElevenLabs, never used to derive wordTarget.
     const elevenLabsText = ssmlScript.length > ELEVENLABS_CHAR_LIMIT
       ? ssmlScript.slice(0, ELEVENLABS_CHAR_LIMIT)
       : ssmlScript;
-    console.log(`[elevenlabs] wordTarget=${wordTarget}, charCount=${ssmlScript.length}, charCountSending=${elevenLabsText.length}`);
+    console.log(`[elevenlabs] charCountSending=${elevenLabsText.length} (limit=${ELEVENLABS_CHAR_LIMIT})`);
     const elevenPayload = {
       text: elevenLabsText,
       model_id: "eleven_multilingual_v2",
