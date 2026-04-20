@@ -455,13 +455,12 @@ app.post("/generate-session", requireAuth, async (req, res) => {
   // Word targets are calibrated for TTS at ~130 WPM slowed to 0.65× ≈ 85 WPM effective,
   // plus SSML pause time. Staying under the char budget prevents mid-session truncation.
   const ELEVENLABS_CHAR_LIMIT = 9800;
-  const SSML_CHARS_PER_WORD   = 2.5;
-  const CHARS_PER_WORD_TOTAL  = 5 + SSML_CHARS_PER_WORD; // 7.5
-  const maxSafeWords  = Math.floor(ELEVENLABS_CHAR_LIMIT / CHARS_PER_WORD_TOTAL); // ~1306
-  const rawWordTarget = { 5: 350, 10: 650, 15: 950, 20: 1150, 30: 1300 }[mins] || 350;
-  const wordTarget    = Math.min(rawWordTarget, maxSafeWords);
-  const maxTokens     = { 5: 600, 10: 1200, 15: 1800, 20: 2400, 30: 3600 }[mins] || 600;
-  console.log(`[generate] mins=${mins}, wordTarget=${wordTarget} (raw=${rawWordTarget}, maxSafe=${maxSafeWords}), maxTokens=${maxTokens}, charBudget=${ELEVENLABS_CHAR_LIMIT}`);
+  // wordTarget is derived purely from requested duration (130 WPM at slowed playback speed).
+  // The 9,800-char limit is a hard ceiling applied only when sending to ElevenLabs and must
+  // never be used to derive wordTarget — both are tracked independently.
+  const wordTarget = mins * 130;
+  const maxTokens  = { 5: 600, 10: 1200, 15: 1800, 20: 2400, 30: 3600 }[mins] || 600;
+  console.log(`[generate] mins=${mins}, wordTarget=${wordTarget}, maxTokens=${maxTokens}, charBudget=${ELEVENLABS_CHAR_LIMIT}`);
   try {
     const prompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins });
     const aiResponse = await axios.post(
@@ -504,8 +503,9 @@ app.post("/generate-session", requireAuth, async (req, res) => {
 
     // cleanScript — all XML/SSML tags stripped; used for display, storage, email
     const cleanScript = ssmlScript
-      .replace(/<[^>]*>/g, " ")   // remove every <tag>
-      .replace(/\s{2,}/g, " ")    // collapse multiple spaces
+      .replace(/<[^>]*>/g, "")        // strip SSML/XML tags
+      .replace(/[ \t]{2,}/g, " ")     // collapse only horizontal whitespace, preserving newlines
+      .replace(/\n{3,}/g, "\n\n")     // normalise to at most double newlines
       .trim();
 
     const voiceId = VOICE_MAP[voice] || VOICE_MAP["Female Calm"];
@@ -515,7 +515,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     const elevenLabsText = ssmlScript.length > ELEVENLABS_CHAR_LIMIT
       ? ssmlScript.slice(0, ELEVENLABS_CHAR_LIMIT)
       : ssmlScript;
-    console.log(`[elevenlabs] Script chars: ${ssmlScript.length}, sending: ${elevenLabsText.length}`);
+    console.log(`[elevenlabs] wordTarget=${wordTarget}, charCount=${ssmlScript.length}, charCountSending=${elevenLabsText.length}`);
     const elevenPayload = {
       text: elevenLabsText,
       model_id: "eleven_multilingual_v2",
