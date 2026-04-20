@@ -1515,13 +1515,21 @@ app.get("/testimonials", async (_req, res) => {
       .order("created_at", { ascending: false })
       .limit(6);
     if (error) {
+      // PGRST205 = table does not exist. Return empty array gracefully rather than crashing.
+      // This prevents a 500 from blocking the app while the table is pending creation.
+      const tableNotFound = error.code === "PGRST205" || error.message?.includes("does not exist");
+      if (tableNotFound) {
+        console.warn("[testimonials] Table not found — returning empty array (PGRST205)");
+        return res.json({ success: true, testimonials: [] });
+      }
       console.error("[testimonials] Supabase error:", error.message, error);
       return res.status(500).json({ success: false, error: error.message });
     }
     res.json({ success: true, testimonials: data || [] });
   } catch (err) {
+    // Never let this route return a 500 — an empty list is always a safe fallback
     console.error("[testimonials] Unhandled exception:", err.message, err);
-    res.status(500).json({ success: false, error: "Failed to load testimonials." });
+    res.json({ success: true, testimonials: [] });
   }
 });
 
