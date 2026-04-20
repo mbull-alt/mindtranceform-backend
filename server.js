@@ -736,7 +736,7 @@ app.get("/sessions/:id", requireAuth, async (req, res) => {
   // Excludes audio_base64 — audio is served separately via /sessions/:id/audio
   let { data, error } = await supabase
     .from("sessions")
-    .select("id, title, program, voice, background, script, created_at, white_label_id")
+    .select("id, title, program, voice, background, script, created_at")
     .eq("user_id", req.user.id)
     .eq("id", req.params.id)
     .single();
@@ -745,7 +745,7 @@ app.get("/sessions/:id", requireAuth, async (req, res) => {
   if ((error || !data) && req.user.email) {
     const fb = await supabase
       .from("sessions")
-      .select("id, title, program, voice, background, script, created_at, white_label_id")
+      .select("id, title, program, voice, background, script, created_at")
       .eq("email", req.user.email)
       .eq("id", req.params.id)
       .single();
@@ -1262,11 +1262,7 @@ app.get("/whitelabel/admin", requireAuth, async (req, res) => {
       .single();
     if (error || !account) return res.status(404).json({ success: false, error: "No white label account found." });
 
-    const { count } = await supabase.from("sessions")
-      .select("*", { count: "exact", head: true })
-      .eq("white_label_id", account.id);
-
-    res.json({ success: true, account, session_count: count || 0 });
+    res.json({ success: true, account, session_count: 0 });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -1422,13 +1418,21 @@ app.post("/testimonial", requireAuth, async (req, res) => {
 });
 
 app.get("/testimonials", async (_req, res) => {
-  const { data, error } = await supabase.from("testimonials")
-    .select("id, user_name, program, rating, message, created_at")
-    .eq("approved", true)
-    .order("created_at", { ascending: false })
-    .limit(6);
-  if (error) return res.status(500).json({ success: false, error: error.message });
-  res.json({ success: true, testimonials: data || [] });
+  try {
+    const { data, error } = await supabase.from("testimonials")
+      .select("id, user_name, program, rating, message, created_at")
+      .eq("approved", true)
+      .order("created_at", { ascending: false })
+      .limit(6);
+    if (error) {
+      console.error("[testimonials] Supabase error:", error.message, error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+    res.json({ success: true, testimonials: data || [] });
+  } catch (err) {
+    console.error("[testimonials] Unhandled exception:", err.message, err);
+    res.status(500).json({ success: false, error: "Failed to load testimonials." });
+  }
 });
 
 app.get("/admin/testimonials", requireAdmin, async (_req, res) => {
