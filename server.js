@@ -327,10 +327,11 @@ function cleanScriptForTTS(script) {
 }
 
 // ─── AUDIO TEMPO ─────────────────────────────────────────────────────────────
-// Slow the ElevenLabs audio buffer to `tempo` (0.75 = 75% speed) using
+// Slow the ElevenLabs audio buffer to `tempo` (0.5 = 50% speed) using
 // ffmpeg's atempo filter, which preserves pitch. Falls back to the original
 // buffer if ffmpeg is unavailable or fails.
-function slowDownAudio(inputBuffer, tempo = 0.75) {
+// NOTE: atempo minimum is 0.5. To go slower, chain two filters (e.g. 0.5,0.5 = 0.25x).
+function slowDownAudio(inputBuffer, tempo = 0.5) {
   return new Promise((resolve) => {
     const tag = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const inputPath  = path.join(os.tmpdir(), `tts_in_${tag}.mp3`);
@@ -348,8 +349,14 @@ function slowDownAudio(inputBuffer, tempo = 0.75) {
       return resolve(inputBuffer);
     }
 
+    // For tempo >= 0.5, a single atempo filter is sufficient.
+    // For tempo < 0.5, chain two filters: e.g. atempo=0.5,atempo=0.5 = 0.25x
+    const filterStr = tempo >= 0.5
+      ? `atempo=${tempo}`
+      : `atempo=0.5,atempo=${(tempo / 0.5).toFixed(4)}`;
+
     exec(
-      `ffmpeg -i "${inputPath}" -filter:a "atempo=${tempo}" -y "${outputPath}"`,
+      `ffmpeg -i "${inputPath}" -filter:a "${filterStr}" -y "${outputPath}"`,
       { timeout: 60000 },
       (err) => {
         if (err) {
@@ -367,6 +374,77 @@ function slowDownAudio(inputBuffer, tempo = 0.75) {
           cleanup();
           resolve(inputBuffer);
         }
+      }
+    );
+  });
+}
+
+// ─── AUDIO PADDING ───────────────────────────────────────────────────────────
+// Pad the audio buffer with silence at the end to reach targetSeconds duration.
+// This is free — no API calls, no tokens. Used to fill remaining time after
+// slowing when the generated script is still shorter than requested.
+function padAudioToTarget(inputBuffer, targetSeconds) {
+  return new Promise((resolve) => {
+    const tag = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const inputPath  = path.join(os.tmpdir(), `tts_pad_in_${tag}.mp3`);
+    const outputPath = path.join(os.tmpdir(), `tts_pad_out_${tag}.mp3`);
+
+    const cleanup = () => {
+      try { fs.unlinkSync(inputPath);  } catch {}
+      try { fs.unlinkSync(outputPath); } catch {}
+    };
+
+    try {
+      fs.writeFileSync(inputPath, inputBuffer);
+    } catch (err) {
+      console.warn("[audio] pad: could not write temp file:", err.message);
+      return resolve(inputBuffer);
+    }
+
+    // Get the actual duration first
+    exec(
+      `ffprobe -i "${inputPath}" -show_entries format=duration -v quiet -of csv=p=0`,
+      (probeErr, stdout) => {
+        const actualDuration = parseFloat((stdout || "").trim());
+        if (probeErr || isNaN(actualDuration)) {
+          console.warn("[audio] pad: ffprobe failed, skipping padding");
+          cleanup();
+          return resolve(inputBuffer);
+        }
+
+        console.log(`[audio] pad: actual=${actualDuration.toFixed(1)}s target=${targetSeconds}s`);
+
+        if (actualDuration >= targetSeconds) {
+          // Already long enough — no padding needed
+          console.log("[audio] pad: already at or above target, skipping");
+          cleanup();
+          return resolve(inputBuffer);
+        }
+
+        const padSeconds = Math.ceil(targetSeconds - actualDuration);
+        console.log(`[audio] pad: adding ${padSeconds}s of silence`);
+
+        exec(
+          `ffmpeg -i "${inputPath}" -af "apad=pad_dur=${padSeconds}" -t ${targetSeconds} -y "${outputPath}"`,
+          { timeout: 60000 },
+          (padErr) => {
+            if (padErr) {
+              console.warn("[audio] pad: ffmpeg apad failed:", padErr.message);
+              cleanup();
+              return resolve(inputBuffer);
+            }
+            try {
+              const padded = fs.readFileSync(outputPath);
+              cleanup();
+              console.log(`[audio] pad complete — ${inputBuffer.length} → ${padded.length} bytes`);
+              resolve(padded);
+            } catch (readErr) {
+              console.warn("[audio] pad: could not read output:", readErr.message);
+              cleanup();
+              resolve(inputBuffer);
+            }
+          }
+        );
       }
     );
   });
@@ -456,8 +534,9 @@ app.post("/generate-session", requireAuth, async (req, res) => {
   const ELEVENLABS_CHAR_LIMIT = 9800;
   const wordTarget = mins * 130;
   // maxTokens must be large enough to generate the full wordTarget in one AI pass.
-  // Tokens ≈ words × 1.35 (English prose) + ~20 % overhead for SSML break tags.
-  const maxTokens = Math.ceil(wordTarget * 1.65);
+  // Tokens ≈ words × 1.35 (English prose) + ~50% overhead for SSML break tags and formatting.
+  // Using 2.5x multiplier to ensure the AI is never cut off before finishing the script.
+  const maxTokens = Math.ceil(wordTarget * 2.5);
   console.log(`[generate] mins=${mins}, maxTokens=${maxTokens}`);
   try {
     const prompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins });
@@ -473,7 +552,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     let currentWordCount = rawScript.replace(/<[^>]*>/g, "").trim().split(/\s+/).filter(Boolean).length;
     console.log(`Script word count: ${currentWordCount}, Target: ${wordTarget}`);
 
-    for (let attempt = 0; attempt < 3 && currentWordCount < wordTarget * 0.85; attempt++) {
+    for (let attempt = 0; attempt < 5 && currentWordCount < wordTarget * 0.85; attempt++) {
       const shortfall = wordTarget - currentWordCount;
       console.log(`[generate] Expansion attempt ${attempt + 1}: ${currentWordCount} words, need ${wordTarget} (shortfall ${shortfall})`);
       const expandResponse = await axios.post(
@@ -499,11 +578,15 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     // ssmlScript — retains <break> tags for ElevenLabs audio generation
     const ssmlScript = cleanScriptForTTS(rawScript);
 
-    // cleanScript — all XML/SSML tags stripped; used for display, storage, email
+    // cleanScript — all XML/SSML tags stripped; used for display, storage, email.
+    // IMPORTANT: convert <break> tags to newlines FIRST so pause points become
+    // paragraph breaks in the displayed text instead of collapsing into one long paragraph.
     const cleanScript = ssmlScript
-      .replace(/<[^>]*>/g, "")        // strip SSML/XML tags
-      .replace(/[ \t]{2,}/g, " ")     // collapse only horizontal whitespace, preserving newlines
-      .replace(/\n{3,}/g, "\n\n")     // normalise to at most double newlines
+      .replace(/<break[^>]*\/>/g, "\n\n")  // convert SSML break tags → paragraph breaks
+      .replace(/<[^>]*>/g, "")             // strip any remaining XML/SSML tags
+      .replace(/[ \t]{2,}/g, " ")          // collapse horizontal whitespace only
+      .replace(/\n[ \t]+/g, "\n")          // remove leading spaces on new lines
+      .replace(/\n{3,}/g, "\n\n")          // normalise to at most double newlines
       .trim();
 
     // Log wordTarget and scriptCharCount as independent values.
@@ -540,8 +623,12 @@ app.post("/generate-session", requireAuth, async (req, res) => {
         throw new Error(`ElevenLabs ${elevenRes.status}: ${errBody}`);
       }
       const arrayBuf = await elevenRes.arrayBuffer();
-      const slowed = await slowDownAudio(Buffer.from(arrayBuf), 0.65);
-      audioBase64 = slowed.toString("base64");
+      // Step 1: Slow to 0.5x (half speed — deeper, more hypnotic, and 30% longer than 0.65x)
+      const slowed = await slowDownAudio(Buffer.from(arrayBuf), 0.5);
+      // Step 2: Pad with silence to reach the requested session duration exactly (free — no API calls)
+      const targetSeconds = mins * 60;
+      const padded = await padAudioToTarget(slowed, targetSeconds);
+      audioBase64 = padded.toString("base64");
     } catch (audioErr) {
       console.error(`[elevenlabs] Audio generation failed: ${audioErr.message}`);
       audioUnavailable = true;
@@ -868,27 +955,27 @@ Write EVERY section in full, unhurried detail:
 If you reach the closing section before ${wordTarget} words, go back and expand earlier sections. Do not stop writing early under any circumstances.
 
 PAUSE NOTATION — use SSML break tags for every pause. Do NOT use dots or ellipses for pauses — they will be read aloud or ignored. Use only these tags:
-- Between every sentence: <break time="1.5s"/>
-- After breathing instructions: <break time="3.5s"/>
-- Between major sections: <break time="2.5s"/>
-- After each countdown number: <break time="4s"/>
-- After each affirmation: <break time="2.5s"/>
-Every pause should feel generous. When in doubt use a longer break time.
+- Between every sentence: <break time="3s"/>
+- After breathing instructions: <break time="7s"/>
+- Between major sections: <break time="5s"/>
+- After each countdown number: <break time="8s"/>
+- After each affirmation: <break time="5s"/>
+Every pause should feel very generous and spacious. When in doubt use a longer break time. Silence is an intentional part of this experience.
 
 BREATHING INSTRUCTION FORMAT — write the opening breathing section exactly like this:
-Breathe in, slowly, through your nose <break time="4s"/> and hold it gently <break time="3s"/> now breathe out, slowly, through your mouth <break time="4s"/> feel your body sink deeper into relaxation <break time="3s"/>
+Breathe in, slowly, through your nose <break time="7s"/> and hold it gently <break time="5s"/> now breathe out, slowly, through your mouth <break time="7s"/> feel your body sink deeper into relaxation <break time="5s"/>
 
 COUNTDOWN FORMAT — write the countdown exactly like this:
-Ten <break time="4s"/> allow yourself to sink deeper <break time="3s"/>
-Nine <break time="4s"/> deeper still <break time="3s"/>
-Eight <break time="4s"/> more relaxed with every number <break time="3s"/>
-Seven <break time="4s"/> letting go of everything now <break time="3s"/>
-Six <break time="4s"/> peaceful and still <break time="3s"/>
-Five <break time="4s"/> halfway there, sinking beautifully <break time="3s"/>
-Four <break time="4s"/> deeper with every word <break time="3s"/>
-Three <break time="4s"/> almost completely at rest <break time="3s"/>
-Two <break time="4s"/> so deeply relaxed now <break time="3s"/>
-One <break time="4s"/> completely, beautifully still <break time="3s"/>
+Ten <break time="8s"/> allow yourself to sink deeper <break time="5s"/>
+Nine <break time="8s"/> deeper still <break time="5s"/>
+Eight <break time="8s"/> more relaxed with every number <break time="5s"/>
+Seven <break time="8s"/> letting go of everything now <break time="5s"/>
+Six <break time="8s"/> peaceful and still <break time="5s"/>
+Five <break time="8s"/> halfway there, sinking beautifully <break time="5s"/>
+Four <break time="8s"/> deeper with every word <break time="5s"/>
+Three <break time="8s"/> almost completely at rest <break time="5s"/>
+Two <break time="8s"/> so deeply relaxed now <break time="5s"/>
+One <break time="8s"/> completely, beautifully still <break time="5s"/>
 
 Do NOT use any stage directions, labels, or parenthetical instructions like (pause), (breathe), (inhale), (exhale) — these will be read aloud verbatim.
 Do NOT use dots or ellipses (...) anywhere — they are not parsed as pauses by the voice engine. Use only the <break> tags above.
