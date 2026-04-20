@@ -450,12 +450,18 @@ app.post("/generate-session", requireAuth, async (req, res) => {
   console.log(`[generate] Received: name=${name}, program=${program}, length=${length}, style=${style}, personalization=${personalization}`);
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
   const mins = parseInt(length) || 5;
-  // ElevenLabs hard limit is 10000 chars. At ~5 chars/word, cap word target at 1800 words (~9000 chars) to stay safe.
+  // ElevenLabs hard limit is 10,000 chars. SSML break tags add ~2.5 chars per spoken word
+  // on top of ~5 chars/word, so the effective char cost is ~7.5 chars/word total.
+  // Word targets are calibrated for TTS at ~130 WPM slowed to 0.65× ≈ 85 WPM effective,
+  // plus SSML pause time. Staying under the char budget prevents mid-session truncation.
   const ELEVENLABS_CHAR_LIMIT = 9800;
-  const rawWordTarget = { 5: 400, 10: 800, 15: 1200, 20: 1600, 30: 2400 }[mins] || 400;
-  const wordTarget = Math.min(rawWordTarget, Math.floor(ELEVENLABS_CHAR_LIMIT / 5));
-  const maxTokens  = { 5: 600, 10: 1200, 15: 1800, 20: 2400, 30: 3600 }[mins] || 600;
-  console.log(`[generate] mins=${mins}, wordTarget=${wordTarget}, maxTokens=${maxTokens}`);
+  const SSML_CHARS_PER_WORD   = 2.5;
+  const CHARS_PER_WORD_TOTAL  = 5 + SSML_CHARS_PER_WORD; // 7.5
+  const maxSafeWords  = Math.floor(ELEVENLABS_CHAR_LIMIT / CHARS_PER_WORD_TOTAL); // ~1306
+  const rawWordTarget = { 5: 350, 10: 650, 15: 950, 20: 1150, 30: 1300 }[mins] || 350;
+  const wordTarget    = Math.min(rawWordTarget, maxSafeWords);
+  const maxTokens     = { 5: 600, 10: 1200, 15: 1800, 20: 2400, 30: 3600 }[mins] || 600;
+  console.log(`[generate] mins=${mins}, wordTarget=${wordTarget} (raw=${rawWordTarget}, maxSafe=${maxSafeWords}), maxTokens=${maxTokens}, charBudget=${ELEVENLABS_CHAR_LIMIT}`);
   try {
     const prompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins });
     const aiResponse = await axios.post(
@@ -847,7 +853,7 @@ Use these slow speech patterns throughout: "slowly, and gently", "allow yourself
 Write in long, flowing sentences with multiple commas creating natural breath points — not short clipped sentences.
 Add a blank line between every single sentence.
 SESSION LENGTH — THIS IS NON-NEGOTIABLE:
-You MUST write exactly ${wordTarget} words of spoken content. Count your words as you write. Do not stop until you reach ${wordTarget} words. This is a ${mins}-minute meditation — at a slow delivery pace of 80 words per minute it requires ${wordTarget} words of content.
+You MUST write exactly ${wordTarget} words of spoken content. Count your words as you write. Do not stop until you reach ${wordTarget} words. This is a ${mins}-minute meditation — the audio is delivered at ~85 words per minute (TTS slowed to 0.65×) plus generous SSML pauses between phrases, so ${wordTarget} words will fill the full session duration.
 Do NOT include SSML tags in your word count — count only spoken words.
 Write EVERY section in full, unhurried detail:
 - Opening: 3 full breathing cycles with 4+ lines each
