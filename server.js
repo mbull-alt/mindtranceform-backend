@@ -528,11 +528,11 @@ app.post("/generate-session", requireAuth, async (req, res) => {
   console.log(`[generate] Received: name=${name}, program=${program}, length=${length}, style=${style}, personalization=${personalization}`);
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
   const mins = parseInt(length) || 5;
-  // wordTarget is the sole driver of script length — derived purely from the requested
-  // duration at 130 WPM (slowed TTS playback). The ElevenLabs char cap is a hard ceiling
-  // applied only at the moment of TTS submission and must never influence wordTarget.
-  const ELEVENLABS_CHAR_LIMIT = 9800;
-  const wordTarget = mins * 130;
+  // Per-chunk limit sent to ElevenLabs. Script is split at paragraph boundaries and each
+  // chunk is synthesised separately then concatenated — no content is truncated.
+  const ELEVENLABS_CHUNK_LIMIT = 2500;
+  // Slow hypnosis speech runs at ~95 WPM. This is the sole driver of script length.
+  const wordTarget = mins * 95;
   // maxTokens must be large enough to generate the full wordTarget in one AI pass.
   // Tokens ≈ words × 1.35 (English prose) + ~50% overhead for SSML break tags and formatting.
   // Using 2.5x multiplier to ensure the AI is never cut off before finishing the script.
@@ -597,33 +597,37 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     const voiceId = VOICE_MAP[voice] || VOICE_MAP["Female Calm"];
     let audioBase64 = null;
     let audioUnavailable = false;
-    // Hard truncation — applied only when sending to ElevenLabs, never used to derive wordTarget.
-    const elevenLabsText = ssmlScript.length > ELEVENLABS_CHAR_LIMIT
-      ? ssmlScript.slice(0, ELEVENLABS_CHAR_LIMIT)
-      : ssmlScript;
-    console.log(`[elevenlabs] charCountSending=${elevenLabsText.length} (limit=${ELEVENLABS_CHAR_LIMIT})`);
-    const elevenPayload = {
-      text: elevenLabsText,
-      model_id: "eleven_multilingual_v2",
-      voice_settings: { stability: 0.5, similarity_boost: 0.75 },
-    };
-    console.log(`[elevenlabs] Sending to voice=${voiceId} chars=${elevenLabsText.length}`);
+    // Split script into chunks and synthesise each separately, then concatenate.
+    // This avoids the per-request character limit truncating long sessions.
+    const ttsChunks = splitIntoTTSChunks(ssmlScript, ELEVENLABS_CHUNK_LIMIT);
+    console.log(`[elevenlabs] ${ssmlScript.length} chars split into ${ttsChunks.length} chunk(s) (limit=${ELEVENLABS_CHUNK_LIMIT} each)`);
     try {
-      const elevenRes = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-        {
-          method: "POST",
-          headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
-          body: JSON.stringify(elevenPayload),
+      const audioBuffers = [];
+      for (let i = 0; i < ttsChunks.length; i++) {
+        const chunk = ttsChunks[i];
+        console.log(`[elevenlabs] Chunk ${i + 1}/${ttsChunks.length}: ${chunk.length} chars`);
+        const elevenRes = await fetch(
+          `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+          {
+            method: "POST",
+            headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              text: chunk,
+              model_id: "eleven_multilingual_v2",
+              voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+            }),
+          }
+        );
+        if (!elevenRes.ok) {
+          const errBody = await elevenRes.text();
+          console.error(`[elevenlabs] Error ${elevenRes.status} on chunk ${i + 1}: ${errBody}`);
+          throw new Error(`ElevenLabs ${elevenRes.status}: ${errBody}`);
         }
-      );
-      if (!elevenRes.ok) {
-        const errBody = await elevenRes.text();
-        console.error(`[elevenlabs] Error ${elevenRes.status}: ${errBody}`);
-        throw new Error(`ElevenLabs ${elevenRes.status}: ${errBody}`);
+        audioBuffers.push(Buffer.from(await elevenRes.arrayBuffer()));
       }
-      const arrayBuf = await elevenRes.arrayBuffer();
-      audioBase64 = Buffer.from(arrayBuf).toString("base64");
+      const combined = Buffer.concat(audioBuffers);
+      audioBase64 = combined.toString("base64");
+      console.log(`[elevenlabs] All ${ttsChunks.length} chunk(s) synthesised, total bytes=${combined.length}`);
     } catch (audioErr) {
       console.error(`[elevenlabs] Audio generation failed: ${audioErr.message}`);
       audioUnavailable = true;
@@ -671,10 +675,76 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     // Return sessionId so the frontend can stream audio from /sessions/:id/audio
     // Do NOT return audioBase64 in the JSON — 5-10MB base64 inside JSON is too large
     // to parse reliably in the browser and causes the result screen to show unavailable.
-    return res.json({ success: true, script: cleanScript, sessionId, audioUnavailable });
+    const wordCount = currentWordCount;
+    const estimatedMinutes = Math.round((wordCount / 95) * 10) / 10;
+    return res.json({ success: true, script: cleanScript, sessionId, audioUnavailable, word_count: wordCount, estimated_minutes: estimatedMinutes });
   } catch (err) {
     const message = err?.response?.data?.error?.message || err.message || "Generation failed.";
     console.error("Generation error:", message);
+    return res.status(500).json({ success: false, error: message });
+  }
+});
+
+// Test endpoint — generates script only, no TTS, no Supabase write. Used to verify
+// script length and structure before spending ElevenLabs credits.
+app.post("/sessions/test-script", requireAuth, async (req, res) => {
+  const { name, goal, program, voice, background, length, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity } = req.body;
+  if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
+  const mins = parseInt(length) || 5;
+  const wordTarget = mins * 95;
+  const maxTokens = Math.ceil(wordTarget * 2.5);
+  console.log(`[test-script] mins=${mins}, wordTarget=${wordTarget}`);
+  try {
+    const prompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins });
+    const aiResponse = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      { model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens, temperature: 0.85 },
+      { headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" } }
+    );
+    let rawScript = aiResponse.data.choices[0]?.message?.content?.trim();
+    if (!rawScript) throw new Error("No script returned from AI.");
+
+    let currentWordCount = rawScript.replace(/<[^>]*>/g, "").trim().split(/\s+/).filter(Boolean).length;
+    console.log(`[test-script] Initial word count: ${currentWordCount}, target: ${wordTarget}`);
+
+    for (let attempt = 0; attempt < 5 && currentWordCount < wordTarget * 0.85; attempt++) {
+      const shortfall = wordTarget - currentWordCount;
+      console.log(`[test-script] Expansion ${attempt + 1}: ${currentWordCount} words, shortfall ${shortfall}`);
+      const expandResponse = await axios.post(
+        "https://api.openai.com/v1/chat/completions",
+        {
+          model: "gpt-4o-mini",
+          messages: [{
+            role: "user",
+            content: `The following meditation script has ${currentWordCount} words but needs to be ${wordTarget} words. Continue the script from where it ends, adding approximately ${shortfall} more words of deep relaxation content: extended visualizations with sensory detail, longer affirmation passages, additional breathing exercises, deeper body scan sections, and more guided imagery. Keep the same calm tone and include SSML <break time="Xs"/> pause tags between sections. Do not add any labels or commentary — output only the continuation of the script.\n\nCurrent script:\n${rawScript}`,
+          }],
+          max_tokens: Math.ceil(shortfall * 2.2),
+          temperature: 0.85,
+        },
+        { headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" } }
+      );
+      const addition = expandResponse.data.choices[0]?.message?.content?.trim();
+      if (addition) rawScript = rawScript + "\n\n" + addition;
+      currentWordCount = rawScript.replace(/<[^>]*>/g, "").trim().split(/\s+/).filter(Boolean).length;
+      console.log(`[test-script] After expansion ${attempt + 1}: ${currentWordCount} words`);
+    }
+
+    const ssmlScript = cleanScriptForTTS(rawScript);
+    const cleanScript = ssmlScript
+      .replace(/<break[^>]*\/>/g, "\n\n")
+      .replace(/<[^>]*>/g, "")
+      .replace(/[ \t]{2,}/g, " ")
+      .replace(/\n[ \t]+/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
+    const wordCount = currentWordCount;
+    const estimatedMinutes = Math.round((wordCount / 95) * 10) / 10;
+    console.log(`[test-script] Done — word_count=${wordCount}, estimated_minutes=${estimatedMinutes}`);
+    return res.json({ script: cleanScript, word_count: wordCount, estimated_minutes: estimatedMinutes });
+  } catch (err) {
+    const message = err?.response?.data?.error?.message || err.message || "Generation failed.";
+    console.error("[test-script] Error:", message);
     return res.status(500).json({ success: false, error: message });
   }
 });
@@ -881,6 +951,26 @@ app.get("/sessions/:id/audio", async (req, res) => {
   res.send(buf);
 });
 
+// ─── TTS HELPERS ─────────────────────────────────────────────────────────────
+// Split an SSML script into chunks of at most maxChars, breaking only on
+// paragraph boundaries so SSML tags are never split mid-tag.
+function splitIntoTTSChunks(text, maxChars = 2500) {
+  const paragraphs = text.split(/\n\n+/);
+  const chunks = [];
+  let current = "";
+  for (const para of paragraphs) {
+    const candidate = current ? current + "\n\n" + para : para;
+    if (candidate.length > maxChars && current.length > 0) {
+      chunks.push(current);
+      current = para;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks.filter(Boolean);
+}
+
 // ─── PROMPT ───────────────────────────────────────────────────────────────────
 function buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget = 400, mins = 5 }) {
   const endings = {
@@ -937,16 +1027,26 @@ Use these slow speech patterns throughout: "slowly, and gently", "allow yourself
 Write in long, flowing sentences with multiple commas creating natural breath points — not short clipped sentences.
 Add a blank line between every single sentence.
 SESSION LENGTH — THIS IS NON-NEGOTIABLE:
-You MUST write exactly ${wordTarget} words of spoken content. Count your words as you write. Do not stop until you reach ${wordTarget} words. This is a ${mins}-minute meditation — the audio is delivered at ~130 words per minute plus SSML pauses between phrases, so ${wordTarget} words will fill the full session duration.
+You MUST write approximately ${wordTarget} words of spoken content (minimum ${Math.ceil(wordTarget * 0.9)} words). Count your words as you write. Do not stop until you reach ${wordTarget} words. This is a ${mins}-minute session — the audio is delivered at ~95 words per minute (slow hypnosis pace) plus SSML pauses between phrases, so ${wordTarget} words will fill the full ${mins} minutes.
 Do NOT include SSML tags in your word count — count only spoken words.
+
+SESSION STRUCTURE — follow this five-part structure precisely, in order:
+1. Opening / relaxation induction — ~${Math.round(wordTarget * 0.1)} words: slow breathing, grounding, initial relaxation
+2. Deepening — ~${Math.round(wordTarget * 0.1)} words: countdown from 10, body scan, progressive relaxation
+3. Main therapeutic content and affirmations — ~${Math.round(wordTarget * 0.7)} words: core goal work, vivid visualization with full sensory detail, repeated affirmations, extended imagery
+4. Reinforcement and future pacing — ~${Math.round(wordTarget * 0.1)} words: anchoring the positive state, imagining carrying this forward
+5. Gentle awakening — ~${Math.round(wordTarget * 0.1)} words: counting up, returning to the room, fully alert
+
+CRITICAL: Do NOT include any awakening, counting up, or "returning to the room" language until the final section (section 5). The session must flow continuously without breaking trance. Do not write more than one induction. Do not write more than one awakening sequence.
+
 Write EVERY section in full, unhurried detail:
 - Opening: 3 full breathing cycles with 4+ lines each
-- Body scan: cover every part of the body in sequence, head to toe, at least 2 sentences per region
 - Deepening countdown: 10 to 1 — after each number write 3–4 lines of deepening suggestions
+- Body scan: cover every part of the body in sequence, head to toe, at least 2 sentences per region
 - Visualization: at least 3 distinct scenes with full sensory detail (sight, sound, smell, touch, feeling)
 - Affirmations: minimum 6 affirmations, each spoken twice with a pause between repetitions
 - Closing: a full gentle return, at least 8 lines
-If you reach the closing section before ${wordTarget} words, go back and expand earlier sections. Do not stop writing early under any circumstances.
+If you reach the closing section before ${wordTarget} words, go back and expand sections 3 and 4. Do not stop writing early under any circumstances.
 
 PAUSE NOTATION — use SSML break tags for every pause. Do NOT use dots or ellipses for pauses — they will be read aloud or ignored. Use only these tags:
 - Between every sentence: <break time="3s"/>
