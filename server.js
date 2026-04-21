@@ -605,9 +605,9 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     const elevenPayload = {
       text: elevenLabsText,
       model_id: "eleven_multilingual_v2",
-      voice_settings: { stability: 0.95, similarity_boost: 0.70, style: 0.05, use_speaker_boost: false },
+      voice_settings: { stability: 0.5, similarity_boost: 0.75 },
     };
-    console.log(`[elevenlabs] Sending to voice=${voiceId} payload preview: ${JSON.stringify(elevenPayload).slice(0, 1000)}`);
+    console.log(`[elevenlabs] Sending to voice=${voiceId} chars=${elevenLabsText.length}`);
     try {
       const elevenRes = await fetch(
         `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
@@ -623,12 +623,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
         throw new Error(`ElevenLabs ${elevenRes.status}: ${errBody}`);
       }
       const arrayBuf = await elevenRes.arrayBuffer();
-      // Step 1: Slow to 0.5x (half speed — deeper, more hypnotic, and 30% longer than 0.65x)
-      const slowed = await slowDownAudio(Buffer.from(arrayBuf), 0.5);
-      // Step 2: Pad with silence to reach the requested session duration exactly (free — no API calls)
-      const targetSeconds = mins * 60;
-      const padded = await padAudioToTarget(slowed, targetSeconds);
-      audioBase64 = padded.toString("base64");
+      audioBase64 = Buffer.from(arrayBuf).toString("base64");
     } catch (audioErr) {
       console.error(`[elevenlabs] Audio generation failed: ${audioErr.message}`);
       audioUnavailable = true;
@@ -729,8 +724,7 @@ app.post("/cron/email-sequences", async (req, res) => {
 const PREVIEW_TEXT = "Take a slow, deep breath in............... and breathe out, slowly............... allow yourself to relax..........";
 const PREVIEW_SETTINGS = {
   model_id: "eleven_multilingual_v2",
-  speed: 0.70,
-  voice_settings: { stability: 0.95, similarity_boost: 0.70, style: 0.05, use_speaker_boost: false },
+  voice_settings: { stability: 0.5, similarity_boost: 0.75 },
 };
 
 // GET /preview-voice/:voiceName — returns audio/mpeg stream (used by the app)
@@ -776,7 +770,7 @@ app.get("/test-elevenlabs", async (_req, res) => {
   try {
     const r = await axios.post(
       "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM",
-      { text: "Test.", model_id: "eleven_multilingual_v2", speed: 0.75, voice_settings: { stability: 0.85, similarity_boost: 0.75, style: 0.15, use_speaker_boost: false } },
+      { text: "Test.", model_id: "eleven_multilingual_v2", voice_settings: { stability: 0.5, similarity_boost: 0.75 } },
       { headers: { "xi-api-key": key, "Content-Type": "application/json" }, responseType: "arraybuffer" }
     );
     res.json({ ok: true, keyPrefix: key.slice(0, 10) + "...", bytesReceived: r.data.byteLength });
@@ -943,7 +937,7 @@ Use these slow speech patterns throughout: "slowly, and gently", "allow yourself
 Write in long, flowing sentences with multiple commas creating natural breath points — not short clipped sentences.
 Add a blank line between every single sentence.
 SESSION LENGTH — THIS IS NON-NEGOTIABLE:
-You MUST write exactly ${wordTarget} words of spoken content. Count your words as you write. Do not stop until you reach ${wordTarget} words. This is a ${mins}-minute meditation — the audio is delivered at ~85 words per minute (TTS slowed to 0.65×) plus generous SSML pauses between phrases, so ${wordTarget} words will fill the full session duration.
+You MUST write exactly ${wordTarget} words of spoken content. Count your words as you write. Do not stop until you reach ${wordTarget} words. This is a ${mins}-minute meditation — the audio is delivered at ~130 words per minute plus SSML pauses between phrases, so ${wordTarget} words will fill the full session duration.
 Do NOT include SSML tags in your word count — count only spoken words.
 Write EVERY section in full, unhurried detail:
 - Opening: 3 full breathing cycles with 4+ lines each
