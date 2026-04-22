@@ -379,6 +379,67 @@ function slowDownAudio(inputBuffer, tempo = 0.5) {
   });
 }
 
+// ─── MP3 RE-MUX ──────────────────────────────────────────────────────────────
+// Re-encode a concatenated MP3 buffer into a single clean CBR stream with a
+// proper Xing/Info header so the browser reports the correct total duration.
+// Falls back to the raw buffer if ffmpeg is unavailable or fails.
+function remuxMp3(inputBuffer) {
+  return new Promise((resolve) => {
+    const tag = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const inputPath  = path.join(os.tmpdir(), `mt_concat_in_${tag}.mp3`);
+    const outputPath = path.join(os.tmpdir(), `mt_remux_out_${tag}.mp3`);
+    const cleanup = () => {
+      try { fs.unlinkSync(inputPath);  } catch {}
+      try { fs.unlinkSync(outputPath); } catch {}
+    };
+    try { fs.writeFileSync(inputPath, inputBuffer); } catch (err) {
+      console.warn("[remux] could not write temp file:", err.message);
+      return resolve(inputBuffer);
+    }
+    exec(
+      `ffmpeg -y -i "${inputPath}" -c:a libmp3lame -b:a 128k -f mp3 "${outputPath}"`,
+      { timeout: 120000 },
+      (err) => {
+        if (err) {
+          console.warn("[remux] ffmpeg re-mux failed — serving raw concat MP3:", err.message);
+          cleanup();
+          return resolve(inputBuffer);
+        }
+        try {
+          const remuxed = fs.readFileSync(outputPath);
+          cleanup();
+          console.log(`[remux] complete: ${inputBuffer.length} → ${remuxed.length} bytes`);
+          resolve(remuxed);
+        } catch (readErr) {
+          console.warn("[remux] could not read ffmpeg output:", readErr.message);
+          cleanup();
+          resolve(inputBuffer);
+        }
+      }
+    );
+  });
+}
+
+// Run ffprobe on a buffer and return the duration in seconds, or null if
+// ffprobe is unavailable or the file is unreadable.
+function probeDuration(inputBuffer) {
+  return new Promise((resolve) => {
+    const tag = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const inputPath = path.join(os.tmpdir(), `mt_probe_${tag}.mp3`);
+    try { fs.writeFileSync(inputPath, inputBuffer); } catch { return resolve(null); }
+    exec(
+      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputPath}"`,
+      { timeout: 30000 },
+      (err, stdout) => {
+        try { fs.unlinkSync(inputPath); } catch {}
+        if (err || !stdout?.trim()) return resolve(null);
+        const d = parseFloat(stdout.trim());
+        resolve(isFinite(d) ? d : null);
+      }
+    );
+  });
+}
+
 // ─── AUDIO PADDING ───────────────────────────────────────────────────────────
 // Pad the audio buffer with silence at the end to reach targetSeconds duration.
 // This is free — no API calls, no tokens. Used to fill remaining time after
@@ -537,8 +598,10 @@ app.post("/generate-session", requireAuth, async (req, res) => {
   const breakSecondsEstimate = mins * 6;
   const spokenSecondsNeeded = (mins * 60) - breakSecondsEstimate;
   const wordTarget = Math.round((spokenSecondsNeeded / 60) * 105);
-  // maxTokens: words × 2.5 covers SSML tag overhead and ensures the AI is never cut off.
-  const maxTokens = Math.ceil(wordTarget * 2.5);
+  // maxTokens: scale with session length; minimum 2000 to prevent cut-off on short sessions.
+  // At ~1.3 tokens/word plus SSML overhead, a 1890-word script needs ~3500 tokens minimum.
+  // Using mins*300 gives comfortable headroom: 20 min → 6000, 5 min → 2000.
+  const maxTokens = Math.max(mins * 300, 2000);
   console.log(`[generate] mins=${mins}, maxTokens=${maxTokens}`);
   try {
     const prompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins });
@@ -577,7 +640,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
             role: "user",
             content: `Your previous script was ${currentWordCount} spoken words but needs a minimum of ${wordTarget} spoken words. SSML tags like <break time="3s"/> do NOT count as words — count only actual spoken words. Expand the therapeutic content and reinforcement sections with additional imagery, repetition of suggestions in varied wording, and deeper sensory detail. Return the FULL expanded script — do not shorten any existing content. Do not add titles, labels, or commentary.\n\nScript to expand:\n${rawScript}`,
           }],
-          max_tokens: Math.ceil(wordTarget * 2.5),
+          max_tokens: maxTokens,
           temperature: 0.85,
         },
         { headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" } }
@@ -624,6 +687,16 @@ app.post("/generate-session", requireAuth, async (req, res) => {
           throw new Error(`Regenerated script too short: ${currentWordCount} words (target: ${wordTarget})`);
         }
       }
+    }
+
+    // Normalize malformed SSML break tags from LLM output before TTS.
+    // The LLM frequently produces <break time="3s/> (missing closing quote) or
+    // <break time='3s'/> — ElevenLabs silently ignores these, killing all pauses.
+    {
+      const breaksBefore = (rawScript.match(/<break/gi) || []).length;
+      rawScript = rawScript.replace(/<break\s+time=["']?([\d.]+)s["']?\s*\/?>/gi, '<break time="$1s"/>');
+      const breaksAfter = (rawScript.match(/<break\s+time="[\d.]+s"\s*\/>/g) || []).length;
+      console.log(`[SSML FIX] normalized break tags: ${breaksAfter} valid out of ${breaksBefore} found`);
     }
 
     // ssmlScript — retains <break> tags for ElevenLabs audio generation
@@ -693,18 +766,35 @@ app.post("/generate-session", requireAuth, async (req, res) => {
         const chunkEstSecs = Math.round(chunkBuf.length / 16000);
         console.log(`[CHUNK ${i + 1} DONE] byte_count=${chunkBuf.length} estimated_seconds=${chunkEstSecs}`);
       }
-      const combined = Buffer.concat(audioBuffers);
-      audioBase64 = combined.toString("base64");
-
-      // ── Post-TTS stats ─────────────────────────────────────────────────────
-      const totalBytes = combined.length;
-      const estimatedSecs = Math.round(totalBytes / 16000); // MP3 ~128kbps
-      const estMins = Math.floor(estimatedSecs / 60);
-      const estSecs = estimatedSecs % 60;
+      const rawConcatenated = Buffer.concat(audioBuffers);
       console.log(`[AUDIO STATS] Audio bytes per chunk: [${audioBuffers.map(b => b.length).join(", ")}]`);
-      console.log(`[AUDIO STATS] Total audio bytes: ${totalBytes}`);
-      console.log(`[AUDIO STATS] Estimated duration: ${estimatedSecs}s (${estMins}:${String(estSecs).padStart(2, "0")})`);
-      console.log(`[elevenlabs] All ${ttsChunks.length} chunk(s) synthesised, total bytes=${totalBytes}`);
+      console.log(`[AUDIO STATS] Total raw concat bytes: ${rawConcatenated.length}`);
+
+      // Re-mux concatenated chunks into a single clean CBR MP3 with a proper
+      // Xing/Info header — without this the browser reads only the first chunk's
+      // metadata and reports the wrong total duration.
+      const finalAudio = await remuxMp3(rawConcatenated);
+      audioBase64 = finalAudio.toString("base64");
+
+      // ── Post-TTS duration assertion ────────────────────────────────────────
+      const byteEstimatedSecs = Math.round(finalAudio.length / 16000);
+      const probedSecs = await probeDuration(finalAudio);
+      if (probedSecs !== null) {
+        const delta = Math.abs(probedSecs - byteEstimatedSecs);
+        const probedMins = Math.floor(probedSecs / 60);
+        const probedSecPart = Math.round(probedSecs % 60);
+        console.log(`[FINAL AUDIO] duration=${Math.round(probedSecs)}s (${probedMins}:${String(probedSecPart).padStart(2, "0")}) expected=${byteEstimatedSecs}s delta=${Math.round(delta)}s`);
+        if (delta > 5) {
+          console.error(`[FINAL AUDIO] ASSERTION FAILED — re-mux produced mismatched metadata (delta=${Math.round(delta)}s). Marking audio unavailable.`);
+          audioUnavailable = true;
+          audioBase64 = null;
+        }
+      } else {
+        const estMins = Math.floor(byteEstimatedSecs / 60);
+        const estSecPart = byteEstimatedSecs % 60;
+        console.log(`[FINAL AUDIO] ffprobe unavailable — byte-estimate: ${byteEstimatedSecs}s (${estMins}:${String(estSecPart).padStart(2, "0")})`);
+      }
+      console.log(`[elevenlabs] All ${ttsChunks.length} chunk(s) synthesised`);
     } catch (audioErr) {
       console.error(`[elevenlabs] Audio generation failed: ${audioErr.message}`);
       audioUnavailable = true;
