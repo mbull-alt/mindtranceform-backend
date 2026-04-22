@@ -575,20 +575,21 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     }
     console.log(`Script word count: ${currentWordCount}, Target: ${wordTarget}`);
 
-    // Validate that awakening language does not appear before the final 3 paragraphs.
-    // If it does, regenerate once with an explicit correction note in the prompt.
+    // Validate that awakening language does not appear before the final 10% of paragraphs.
+    // Awakening language in the last 10% is correct placement — do not flag it.
     const validationParagraphs = rawScript.split(/\n\n+/).filter(Boolean);
     const awakeningPhrases = [
       "open your eyes", "coming back", "returning to the room",
       "wiggle your fingers", "count from 1 to 5", "count to five", "wide awake",
     ];
+    const safeZoneStart = Math.floor(validationParagraphs.length * 0.9);
     const earlyAwakeningIndex = validationParagraphs
-      .slice(0, Math.max(0, validationParagraphs.length - 3))
+      .slice(0, safeZoneStart)
       .findIndex(p => awakeningPhrases.some(phrase => p.toLowerCase().includes(phrase)));
     if (earlyAwakeningIndex !== -1) {
-      console.warn(`[SCRIPT VALIDATION] Awakening language found in paragraph ${earlyAwakeningIndex + 1} — regenerating`);
+      console.warn(`[SCRIPT VALIDATION] Awakening language found in paragraph ${earlyAwakeningIndex + 1}/${validationParagraphs.length} (safe zone starts at ${safeZoneStart}) — regenerating`);
       const correctionPrompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins })
-        + "\n\nIMPORTANT: Your previous attempt contained awakening language in the middle of the session. Do not do this. The words 'open your eyes' must only appear in the final paragraph.";
+        + `\n\nIMPORTANT: Your previous attempt contained awakening language mid-session. Do not repeat this. Also, you MUST write the full ${wordTarget} words — do not write a shorter script.`;
       const regenResponse = await axios.post(
         "https://api.openai.com/v1/chat/completions",
         { model: "gpt-4o-mini", messages: [{ role: "user", content: correctionPrompt }], max_tokens: maxTokens, temperature: 0.85 },
@@ -599,6 +600,9 @@ app.post("/generate-session", requireAuth, async (req, res) => {
         rawScript = regenScript;
         currentWordCount = rawScript.replace(/<[^>]*>/g, "").trim().split(/\s+/).filter(Boolean).length;
         console.log(`[SCRIPT VALIDATION] Regenerated script word count: ${currentWordCount}`);
+        if (currentWordCount < wordTarget * 0.85) {
+          throw new Error(`Regenerated script too short: ${currentWordCount} words (target: ${wordTarget})`);
+        }
       }
     }
 
