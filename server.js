@@ -575,6 +575,33 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     }
     console.log(`Script word count: ${currentWordCount}, Target: ${wordTarget}`);
 
+    // Validate that awakening language does not appear before the final 3 paragraphs.
+    // If it does, regenerate once with an explicit correction note in the prompt.
+    const validationParagraphs = rawScript.split(/\n\n+/).filter(Boolean);
+    const awakeningPhrases = [
+      "open your eyes", "coming back", "returning to the room",
+      "wiggle your fingers", "count from 1 to 5", "count to five", "wide awake",
+    ];
+    const earlyAwakeningIndex = validationParagraphs
+      .slice(0, Math.max(0, validationParagraphs.length - 3))
+      .findIndex(p => awakeningPhrases.some(phrase => p.toLowerCase().includes(phrase)));
+    if (earlyAwakeningIndex !== -1) {
+      console.warn(`[SCRIPT VALIDATION] Awakening language found in paragraph ${earlyAwakeningIndex + 1} — regenerating`);
+      const correctionPrompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins })
+        + "\n\nIMPORTANT: Your previous attempt contained awakening language in the middle of the session. Do not do this. The words 'open your eyes' must only appear in the final paragraph.";
+      const regenResponse = await axios.post(
+        "https://api.openai.com/v1/chat/completions",
+        { model: "gpt-4o-mini", messages: [{ role: "user", content: correctionPrompt }], max_tokens: maxTokens, temperature: 0.85 },
+        { headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" } }
+      );
+      const regenScript = regenResponse.data.choices[0]?.message?.content?.trim();
+      if (regenScript) {
+        rawScript = regenScript;
+        currentWordCount = rawScript.replace(/<[^>]*>/g, "").trim().split(/\s+/).filter(Boolean).length;
+        console.log(`[SCRIPT VALIDATION] Regenerated script word count: ${currentWordCount}`);
+      }
+    }
+
     // ssmlScript — retains <break> tags for ElevenLabs audio generation
     const ssmlScript = cleanScriptForTTS(rawScript);
 
@@ -613,8 +640,8 @@ app.post("/generate-session", requireAuth, async (req, res) => {
             headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
             body: JSON.stringify({
               text: chunk,
-              model_id: "eleven_multilingual_v2",
-              voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+              model_id: "eleven_turbo_v2_5",
+              voice_settings: { stability: 0.75, similarity_boost: 0.75, speed: 0.85 },
             }),
           }
         );
@@ -1074,27 +1101,27 @@ Write EVERY section in full, unhurried detail:
 If you reach the closing section before ${wordTarget} words, go back and expand sections 3 and 4. Do not stop writing early under any circumstances.
 
 PAUSE NOTATION — use SSML break tags for every pause. Do NOT use dots or ellipses for pauses — they will be read aloud or ignored. Use only these tags:
-- Between every sentence: <break time="3s"/>
-- After breathing instructions: <break time="7s"/>
-- Between major sections: <break time="5s"/>
-- After each countdown number: <break time="8s"/>
-- After each affirmation: <break time="5s"/>
-Every pause should feel very generous and spacious. When in doubt use a longer break time. Silence is an intentional part of this experience.
+- Between every sentence: <break time="1.5s"/>
+- After breathing instructions: <break time="3s"/>
+- Between major sections: <break time="2s"/>
+- After each countdown number: <break time="3s"/>
+- After each affirmation: <break time="2s"/>
+Pauses should feel calm and unhurried. Do not use longer breaks than specified above.
 
 BREATHING INSTRUCTION FORMAT — write the opening breathing section exactly like this:
-Breathe in, slowly, through your nose <break time="7s"/> and hold it gently <break time="5s"/> now breathe out, slowly, through your mouth <break time="7s"/> feel your body sink deeper into relaxation <break time="5s"/>
+Breathe in, slowly, through your nose <break time="3s"/> and hold it gently <break time="2s"/> now breathe out, slowly, through your mouth <break time="3s"/> feel your body sink deeper into relaxation <break time="2s"/>
 
 COUNTDOWN FORMAT — write the countdown exactly like this:
-Ten <break time="8s"/> allow yourself to sink deeper <break time="5s"/>
-Nine <break time="8s"/> deeper still <break time="5s"/>
-Eight <break time="8s"/> more relaxed with every number <break time="5s"/>
-Seven <break time="8s"/> letting go of everything now <break time="5s"/>
-Six <break time="8s"/> peaceful and still <break time="5s"/>
-Five <break time="8s"/> halfway there, sinking beautifully <break time="5s"/>
-Four <break time="8s"/> deeper with every word <break time="5s"/>
-Three <break time="8s"/> almost completely at rest <break time="5s"/>
-Two <break time="8s"/> so deeply relaxed now <break time="5s"/>
-One <break time="8s"/> completely, beautifully still <break time="5s"/>
+Ten <break time="3s"/> allow yourself to sink deeper <break time="2s"/>
+Nine <break time="3s"/> deeper still <break time="2s"/>
+Eight <break time="3s"/> more relaxed with every number <break time="2s"/>
+Seven <break time="3s"/> letting go of everything now <break time="2s"/>
+Six <break time="3s"/> peaceful and still <break time="2s"/>
+Five <break time="3s"/> halfway there, sinking beautifully <break time="2s"/>
+Four <break time="3s"/> deeper with every word <break time="2s"/>
+Three <break time="3s"/> almost completely at rest <break time="2s"/>
+Two <break time="3s"/> so deeply relaxed now <break time="2s"/>
+One <break time="3s"/> completely, beautifully still <break time="2s"/>
 
 Do NOT use any stage directions, labels, or parenthetical instructions like (pause), (breathe), (inhale), (exhale) — these will be read aloud verbatim.
 Do NOT use dots or ellipses (...) anywhere — they are not parsed as pauses by the voice engine. Use only the <break> tags above.
