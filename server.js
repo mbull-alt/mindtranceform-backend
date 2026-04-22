@@ -531,9 +531,9 @@ app.post("/generate-session", requireAuth, async (req, res) => {
   // Per-chunk limit sent to ElevenLabs. Script is always split into chunks regardless of
   // total length — each chunk is synthesised separately then concatenated in order.
   const ELEVENLABS_CHUNK_LIMIT = 1500;
-  // eleven_multilingual_v2 at speed 0.75 speaks at ~110 WPM. Word target is spoken
-  // words only — SSML tags are stripped before counting against this target.
-  const wordTarget = mins * 110;
+  // eleven_multilingual_v2 at speed 0.68 speaks at ~80 WPM (including natural pauses).
+  // Word target is spoken words only — SSML tags are stripped before counting.
+  const wordTarget = Math.round(mins * 80);
   // maxTokens must be large enough to generate the full wordTarget in one AI pass.
   // Tokens ≈ words × 1.35 (English prose) + ~50% overhead for SSML break tags and formatting.
   // Using 2.5x multiplier to ensure the AI is never cut off before finishing the script.
@@ -616,6 +616,8 @@ app.post("/generate-session", requireAuth, async (req, res) => {
 
     // ssmlScript — retains <break> tags for ElevenLabs audio generation
     const ssmlScript = cleanScriptForTTS(rawScript);
+    const preTTSWordCount = countSpokenWords(ssmlScript);
+    console.log(`[generate] Pre-TTS stripped word count: ${preTTSWordCount} words (target: ${wordTarget}, ${Math.round(preTTSWordCount / wordTarget * 100)}% of target)`);
 
     // cleanScript — all XML/SSML tags stripped; used for display, storage, email.
     // IMPORTANT: convert <break> tags to newlines FIRST so pause points become
@@ -642,7 +644,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
 
     const ttsChunks = splitIntoTTSChunks(ssmlScript, ELEVENLABS_CHUNK_LIMIT);
     const modelId = "eleven_multilingual_v2";
-    const voiceSettings = { stability: 0.85, similarity_boost: 0.75, speed: 0.75 };
+    const voiceSettings = { stability: 0.85, similarity_boost: 0.75, speed: 0.68 };
     console.log(`[AUDIO STATS] Script chars (no tags): ${charsNoTags}`);
     console.log(`[AUDIO STATS] Script chars (with tags): ${charsWithTags}`);
     console.log(`[AUDIO STATS] Chunks: ${ttsChunks.length}`);
@@ -1014,6 +1016,20 @@ app.get("/sessions/:id/audio", async (req, res) => {
   res.send(buf);
 });
 
+app.delete("/sessions/:id", requireAuth, async (req, res) => {
+  console.log(`[sessions] Deleting session_id=${req.params.id} for user_id=${req.user.id}`);
+  const { error } = await supabase
+    .from("sessions")
+    .delete()
+    .eq("user_id", req.user.id)
+    .eq("id", req.params.id);
+  if (error) {
+    console.error("[sessions] Delete failed:", error.message);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+  res.json({ success: true });
+});
+
 // ─── TTS HELPERS ─────────────────────────────────────────────────────────────
 // Split an SSML script into chunks of at most maxChars, breaking only on
 // paragraph boundaries so SSML tags are never split mid-tag.
@@ -1090,7 +1106,7 @@ Use these slow speech patterns throughout: "slowly, and gently", "allow yourself
 Write in long, flowing sentences with multiple commas creating natural breath points — not short clipped sentences.
 Add a blank line between every single sentence.
 SESSION LENGTH — THIS IS NON-NEGOTIABLE:
-You MUST write exactly ${wordTarget} spoken words (minimum ${Math.ceil(wordTarget * 0.9)}). Do NOT count SSML tags like <break time="3s"/> as words — count only the actual words that will be spoken aloud. Keep writing until you reach ${wordTarget} spoken words. This is a ${mins}-minute session delivered at ~110 words per minute (slow hypnosis pace), so ${wordTarget} spoken words will fill the full ${mins} minutes.
+Your script MUST be at least ${wordTarget} spoken words. Do not end the session early. Fill the full duration with therapeutic content, repetition, deepeners, and post-hypnotic suggestions as needed. Do NOT count SSML tags like <break time="3s"/> as words — count only the actual words that will be spoken aloud. Keep writing until you reach ${wordTarget} spoken words. This is a ${mins}-minute session delivered at ~80 words per minute (slow hypnosis pace with pauses), so ${wordTarget} spoken words will fill the full ${mins} minutes.
 
 You are writing a single continuous hypnosis session script.
 Follow this structure strictly — do not deviate:
@@ -1139,7 +1155,8 @@ PAUSE NOTATION — use SSML break tags for every pause. Do NOT use dots or ellip
 - Between major sections: <break time="2s"/>
 - After each countdown number: <break time="3s"/>
 - After each affirmation: <break time="2s"/>
-Pauses should feel calm and unhurried. Do not use longer breaks than specified above.
+- During any countdown or counting sequence, place a <break time="2.5s"/> after each number to allow the listener time to absorb each count.
+Pauses should feel calm and unhurried.
 
 BREATHING INSTRUCTION FORMAT — write the opening breathing section exactly like this:
 Breathe in, slowly, through your nose <break time="3s"/> and hold it gently <break time="2s"/> now breathe out, slowly, through your mouth <break time="3s"/> feel your body sink deeper into relaxation <break time="2s"/>
