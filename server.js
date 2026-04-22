@@ -531,8 +531,9 @@ app.post("/generate-session", requireAuth, async (req, res) => {
   // Per-chunk limit sent to ElevenLabs. Script is always split into chunks regardless of
   // total length — each chunk is synthesised separately then concatenated in order.
   const ELEVENLABS_CHUNK_LIMIT = 1500;
-  // Slow hypnosis speech runs at ~95 WPM. This is the sole driver of script length.
-  const wordTarget = mins * 95;
+  // eleven_multilingual_v2 at speed 0.75 speaks at ~110 WPM. Word target is spoken
+  // words only — SSML tags are stripped before counting against this target.
+  const wordTarget = mins * 110;
   // maxTokens must be large enough to generate the full wordTarget in one AI pass.
   // Tokens ≈ words × 1.35 (English prose) + ~50% overhead for SSML break tags and formatting.
   // Using 2.5x multiplier to ensure the AI is never cut off before finishing the script.
@@ -548,20 +549,27 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     let rawScript = aiResponse.data.choices[0]?.message?.content?.trim();
     if (!rawScript) throw new Error("No script returned from AI.");
 
-    // Expansion loop — up to 3 attempts to reach 85% of word target
-    let currentWordCount = rawScript.replace(/<[^>]*>/g, "").trim().split(/\s+/).filter(Boolean).length;
-    console.log(`Script word count: ${currentWordCount}, Target: ${wordTarget}`);
+    function countSpokenWords(script) {
+      return script.replace(/<[^>]+>/g, "").trim().split(/\s+/).filter(Boolean).length;
+    }
+
+    // Expansion loop — counts spoken words only (SSML tags stripped before counting).
+    let currentWordCount = countSpokenWords(rawScript);
+    {
+      const rawWordCount = rawScript.trim().split(/\s+/).filter(Boolean).length;
+      console.log(`[generate] Spoken words: ${currentWordCount}, Raw words: ${rawWordCount}, SSML tags removed: ${rawWordCount - currentWordCount}, Target: ${wordTarget}`);
+    }
 
     for (let attempt = 0; attempt < 5 && currentWordCount < wordTarget * 0.85; attempt++) {
       const shortfall = wordTarget - currentWordCount;
-      console.log(`[generate] Expansion attempt ${attempt + 1}: ${currentWordCount} words, need ${wordTarget} (shortfall ${shortfall})`);
+      console.log(`[generate] Expansion attempt ${attempt + 1}: ${currentWordCount} spoken words, need ${wordTarget} (shortfall ${shortfall})`);
       const expandResponse = await axios.post(
         "https://api.openai.com/v1/chat/completions",
         {
           model: "gpt-4o-mini",
           messages: [{
             role: "user",
-            content: `The following meditation script has ${currentWordCount} words but needs to be ${wordTarget} words. Continue the script from where it ends, adding approximately ${shortfall} more words of deep relaxation content: extended visualizations with sensory detail, longer affirmation passages, additional breathing exercises, deeper body scan sections, and more guided imagery. Keep the same calm tone and include SSML <break time="Xs"/> pause tags between sections. Do not add any labels or commentary — output only the continuation of the script.\n\nCurrent script:\n${rawScript}`,
+            content: `The following meditation script has ${currentWordCount} spoken words but needs to be ${wordTarget} spoken words. Do NOT count SSML tags like <break time="3s"/> as words — count only actual words that will be spoken aloud. Continue the script from where it ends, adding approximately ${shortfall} more spoken words of deep relaxation content: extended visualizations with sensory detail, longer affirmation passages, additional breathing exercises, deeper body scan sections, and more guided imagery. Keep the same calm tone and include SSML <break time="Xs"/> pause tags between sections. Do not add any labels or commentary — output only the continuation of the script.\n\nCurrent script:\n${rawScript}`,
           }],
           max_tokens: Math.ceil(shortfall * 2.2),
           temperature: 0.85,
@@ -570,10 +578,10 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       );
       const addition = expandResponse.data.choices[0]?.message?.content?.trim();
       if (addition) rawScript = rawScript + "\n\n" + addition;
-      currentWordCount = rawScript.replace(/<[^>]*>/g, "").trim().split(/\s+/).filter(Boolean).length;
-      console.log(`[generate] After expansion ${attempt + 1}: ${currentWordCount} words`);
+      currentWordCount = countSpokenWords(rawScript);
+      console.log(`[generate] After expansion ${attempt + 1}: ${currentWordCount} spoken words`);
     }
-    console.log(`Script word count: ${currentWordCount}, Target: ${wordTarget}`);
+    console.log(`[generate] Final spoken words: ${currentWordCount}, Target: ${wordTarget}`);
 
     // Validate that awakening language does not appear before the final 10% of paragraphs.
     // Awakening language in the last 10% is correct placement — do not flag it.
@@ -598,8 +606,8 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       const regenScript = regenResponse.data.choices[0]?.message?.content?.trim();
       if (regenScript) {
         rawScript = regenScript;
-        currentWordCount = rawScript.replace(/<[^>]*>/g, "").trim().split(/\s+/).filter(Boolean).length;
-        console.log(`[SCRIPT VALIDATION] Regenerated script word count: ${currentWordCount}`);
+        currentWordCount = countSpokenWords(rawScript);
+        console.log(`[SCRIPT VALIDATION] Regenerated spoken word count: ${currentWordCount}`);
         if (currentWordCount < wordTarget * 0.85) {
           throw new Error(`Regenerated script too short: ${currentWordCount} words (target: ${wordTarget})`);
         }
@@ -1082,8 +1090,7 @@ Use these slow speech patterns throughout: "slowly, and gently", "allow yourself
 Write in long, flowing sentences with multiple commas creating natural breath points — not short clipped sentences.
 Add a blank line between every single sentence.
 SESSION LENGTH — THIS IS NON-NEGOTIABLE:
-You MUST write approximately ${wordTarget} words of spoken content (minimum ${Math.ceil(wordTarget * 0.9)} words). Count your words as you write. Do not stop until you reach ${wordTarget} words. This is a ${mins}-minute session — the audio is delivered at ~95 words per minute (slow hypnosis pace) plus SSML pauses between phrases, so ${wordTarget} words will fill the full ${mins} minutes.
-Do NOT include SSML tags in your word count — count only spoken words.
+You MUST write exactly ${wordTarget} spoken words (minimum ${Math.ceil(wordTarget * 0.9)}). Do NOT count SSML tags like <break time="3s"/> as words — count only the actual words that will be spoken aloud. Keep writing until you reach ${wordTarget} spoken words. This is a ${mins}-minute session delivered at ~110 words per minute (slow hypnosis pace), so ${wordTarget} spoken words will fill the full ${mins} minutes.
 
 You are writing a single continuous hypnosis session script.
 Follow this structure strictly — do not deviate:
