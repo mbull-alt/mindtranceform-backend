@@ -554,6 +554,12 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       return script.replace(/<[^>]+>/g, "").trim().split(/\s+/).filter(Boolean).length;
     }
 
+    // ── Diagnostic: log raw LLM output before any processing ─────────────────
+    {
+      const rawStripped = countSpokenWords(rawScript);
+      console.log(`[LLM RAW] char_count=${rawScript.length} stripped_word_count=${rawStripped} first_200_chars="${rawScript.slice(0, 200).replace(/\n/g, "\\n")}" last_200_chars="${rawScript.slice(-200).replace(/\n/g, "\\n")}"`);
+    }
+
     // Validate word count — SSML tags stripped before counting (never count raw script).
     let currentWordCount = countSpokenWords(rawScript);
     console.log(`[generate] Initial spoken words: ${currentWordCount}, Target: ${wordTarget}`);
@@ -578,6 +584,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       );
       const expanded = expandResponse.data.choices[0]?.message?.content?.trim();
       if (expanded) {
+        console.log(`[LLM EXPAND ${attempt + 1}] char_count=${expanded.length} stripped_word_count=${countSpokenWords(expanded)} first_200_chars="${expanded.slice(0, 200).replace(/\n/g, "\\n")}" last_200_chars="${expanded.slice(-200).replace(/\n/g, "\\n")}"`);
         rawScript = expanded;
         currentWordCount = countSpokenWords(rawScript);
       }
@@ -641,6 +648,9 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     let audioBase64 = null;
     let audioUnavailable = false;
 
+    // ── Diagnostic: state of script entering TTS pipeline ────────────────────
+    console.log(`[PRE-CHUNK] char_count=${ssmlScript.length} stripped_word_count=${preTTSWordCount}`);
+
     const ttsChunks = splitIntoTTSChunks(ssmlScript, ELEVENLABS_CHUNK_LIMIT);
     const modelId = "eleven_multilingual_v2";
     const voiceSettings = { stability: 0.85, similarity_boost: 0.75, speed: 0.7 };
@@ -658,7 +668,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       for (let i = 0; i < ttsChunks.length; i++) {
         // Prepend a silent break to chunk 0 so the model initialises before speaking.
         const chunkText = i === 0 ? '<break time="2s"/> ' + ttsChunks[i] : ttsChunks[i];
-        console.log(`[elevenlabs] Chunk ${i + 1}/${ttsChunks.length}: ${chunkText.length} chars`);
+        console.log(`[CHUNK ${i + 1}/${ttsChunks.length}] char_count=${chunkText.length} first_80_chars="${chunkText.slice(0, 80).replace(/\n/g, "\\n")}"`);
         const elevenRes = await fetch(
           `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
           {
@@ -680,7 +690,8 @@ app.post("/generate-session", requireAuth, async (req, res) => {
         }
         const chunkBuf = Buffer.from(await elevenRes.arrayBuffer());
         audioBuffers.push(chunkBuf);
-        console.log(`[elevenlabs] Chunk ${i + 1}/${ttsChunks.length}: OK, audio bytes=${chunkBuf.length}`);
+        const chunkEstSecs = Math.round(chunkBuf.length / 16000);
+        console.log(`[CHUNK ${i + 1} DONE] byte_count=${chunkBuf.length} estimated_seconds=${chunkEstSecs}`);
       }
       const combined = Buffer.concat(audioBuffers);
       audioBase64 = combined.toString("base64");
