@@ -530,7 +530,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
   const mins = parseInt(length) || 5;
   // Per-chunk limit sent to ElevenLabs. Script is always split into chunks regardless of
   // total length — each chunk is synthesised separately then concatenated in order.
-  const ELEVENLABS_CHUNK_LIMIT = 2400;
+  const ELEVENLABS_CHUNK_LIMIT = 1500;
   // Slow hypnosis speech runs at ~95 WPM. This is the sole driver of script length.
   const wordTarget = mins * 95;
   // maxTokens must be large enough to generate the full wordTarget in one AI pass.
@@ -648,10 +648,12 @@ app.post("/generate-session", requireAuth, async (req, res) => {
             body: JSON.stringify({
               text: chunk,
               model_id: "eleven_turbo_v2_5",
-              voice_settings: { stability: 0.75, similarity_boost: 0.75, speed: 0.85 },
+              voice_settings: { stability: 0.75, similarity_boost: 0.75 },
+              output_format: "mp3_44100_128",
             }),
           }
         );
+        console.log(`[elevenlabs] Chunk ${i + 1} headers:`, Object.fromEntries(elevenRes.headers.entries()));
         if (!elevenRes.ok) {
           const errBody = await elevenRes.text();
           console.error(`[elevenlabs] Error ${elevenRes.status} on chunk ${i + 1}: ${errBody}`);
@@ -999,7 +1001,7 @@ app.get("/sessions/:id/audio", async (req, res) => {
 // ─── TTS HELPERS ─────────────────────────────────────────────────────────────
 // Split an SSML script into chunks of at most maxChars, breaking only on
 // paragraph boundaries so SSML tags are never split mid-tag.
-function splitIntoTTSChunks(text, maxChars = 2400) {
+function splitIntoTTSChunks(text, maxChars = 1500) {
   const paragraphs = text.split(/\n\n+/);
   const chunks = [];
   let current = "";
