@@ -531,12 +531,13 @@ app.post("/generate-session", requireAuth, async (req, res) => {
   // Per-chunk limit sent to ElevenLabs. Script is always split into chunks regardless of
   // total length — each chunk is synthesised separately then concatenated in order.
   const ELEVENLABS_CHUNK_LIMIT = 1500;
-  // eleven_multilingual_v2 at speed 0.68 speaks at ~80 WPM (including natural pauses).
-  // Word target is spoken words only — SSML tags are stripped before counting.
-  const wordTarget = Math.round(mins * 80);
-  // maxTokens must be large enough to generate the full wordTarget in one AI pass.
-  // Tokens ≈ words × 1.35 (English prose) + ~50% overhead for SSML break tags and formatting.
-  // Using 2.5x multiplier to ensure the AI is never cut off before finishing the script.
+  // At speed=0.7 on eleven_multilingual_v2, spoken rate is ~105 WPM.
+  // Break time is estimated at ~6s per minute of session; subtract it from total
+  // time to get the seconds of actual speech needed, then convert to word count.
+  const breakSecondsEstimate = mins * 6;
+  const spokenSecondsNeeded = (mins * 60) - breakSecondsEstimate;
+  const wordTarget = Math.round((spokenSecondsNeeded / 60) * 105);
+  // maxTokens: words × 2.5 covers SSML tag overhead and ensures the AI is never cut off.
   const maxTokens = Math.ceil(wordTarget * 2.5);
   console.log(`[generate] mins=${mins}, maxTokens=${maxTokens}`);
   try {
@@ -553,14 +554,13 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       return script.replace(/<[^>]+>/g, "").trim().split(/\s+/).filter(Boolean).length;
     }
 
-    // Expansion loop — counts spoken words only (SSML tags stripped before counting).
+    // Validate word count — SSML tags stripped before counting (never count raw script).
     let currentWordCount = countSpokenWords(rawScript);
-    {
-      const rawWordCount = rawScript.trim().split(/\s+/).filter(Boolean).length;
-      console.log(`[generate] Spoken words: ${currentWordCount}, Raw words: ${rawWordCount}, SSML tags removed: ${rawWordCount - currentWordCount}, Target: ${wordTarget}`);
-    }
+    console.log(`[generate] Initial spoken words: ${currentWordCount}, Target: ${wordTarget}`);
 
-    for (let attempt = 0; attempt < 5 && currentWordCount < wordTarget * 0.85; attempt++) {
+    // Expansion loop: ask LLM to return the full expanded script (not just a continuation).
+    // Max 2 retries to avoid runaway API costs; logs a warning if still short after retries.
+    for (let attempt = 0; attempt < 2 && currentWordCount < wordTarget; attempt++) {
       const shortfall = wordTarget - currentWordCount;
       console.log(`[generate] Expansion attempt ${attempt + 1}: ${currentWordCount} spoken words, need ${wordTarget} (shortfall ${shortfall})`);
       const expandResponse = await axios.post(
@@ -569,17 +569,22 @@ app.post("/generate-session", requireAuth, async (req, res) => {
           model: "gpt-4o-mini",
           messages: [{
             role: "user",
-            content: `The following meditation script has ${currentWordCount} spoken words but needs to be ${wordTarget} spoken words. Do NOT count SSML tags like <break time="3s"/> as words — count only actual words that will be spoken aloud. Continue the script from where it ends, adding approximately ${shortfall} more spoken words of deep relaxation content: extended visualizations with sensory detail, longer affirmation passages, additional breathing exercises, deeper body scan sections, and more guided imagery. Keep the same calm tone and include SSML <break time="Xs"/> pause tags between sections. Do not add any labels or commentary — output only the continuation of the script.\n\nCurrent script:\n${rawScript}`,
+            content: `Your previous script was ${currentWordCount} spoken words but needs a minimum of ${wordTarget} spoken words. SSML tags like <break time="3s"/> do NOT count as words — count only actual spoken words. Expand the therapeutic content and reinforcement sections with additional imagery, repetition of suggestions in varied wording, and deeper sensory detail. Return the FULL expanded script — do not shorten any existing content. Do not add titles, labels, or commentary.\n\nScript to expand:\n${rawScript}`,
           }],
-          max_tokens: Math.ceil(shortfall * 2.2),
+          max_tokens: Math.ceil(wordTarget * 2.5),
           temperature: 0.85,
         },
         { headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" } }
       );
-      const addition = expandResponse.data.choices[0]?.message?.content?.trim();
-      if (addition) rawScript = rawScript + "\n\n" + addition;
-      currentWordCount = countSpokenWords(rawScript);
+      const expanded = expandResponse.data.choices[0]?.message?.content?.trim();
+      if (expanded) {
+        rawScript = expanded;
+        currentWordCount = countSpokenWords(rawScript);
+      }
       console.log(`[generate] After expansion ${attempt + 1}: ${currentWordCount} spoken words`);
+    }
+    if (currentWordCount < wordTarget) {
+      console.warn(`[generate] Script still under target after expansions: ${currentWordCount}/${wordTarget} — proceeding anyway`);
     }
     console.log(`[generate] Final spoken words: ${currentWordCount}, Target: ${wordTarget}`);
 
@@ -636,21 +641,17 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     let audioBase64 = null;
     let audioUnavailable = false;
 
-    // ── Pre-TTS stats ────────────────────────────────────────────────────────
-    const charsNoTags  = ssmlScript.replace(/<[^>]*>/g, "").length;
-    const charsWithTags = ssmlScript.length;
-    const breakMatches = [...ssmlScript.matchAll(/<break\s+time="([\d.]+)s"\s*\/>/g)];
-    const totalBreakSeconds = breakMatches.reduce((sum, m) => sum + parseFloat(m[1]), 0);
-
     const ttsChunks = splitIntoTTSChunks(ssmlScript, ELEVENLABS_CHUNK_LIMIT);
     const modelId = "eleven_multilingual_v2";
-    const voiceSettings = { stability: 0.85, similarity_boost: 0.75, speed: 0.68 };
-    console.log(`[AUDIO STATS] Script chars (no tags): ${charsNoTags}`);
-    console.log(`[AUDIO STATS] Script chars (with tags): ${charsWithTags}`);
-    console.log(`[AUDIO STATS] Chunks: ${ttsChunks.length}`);
-    console.log(`[AUDIO STATS] Chunk sizes: [${ttsChunks.map(c => c.length).join(", ")}]`);
-    console.log(`[AUDIO STATS] Total break time in script: ${totalBreakSeconds}s`);
-    console.log(`[AUDIO STATS] Model: ${modelId}`);
+    const voiceSettings = { stability: 0.85, similarity_boost: 0.75, speed: 0.7 };
+
+    // ── SCRIPT STATS — ground truth before TTS ────────────────────────────────
+    const scriptBreakMatches = [...ssmlScript.matchAll(/<break\s+time="([\d.]+)s"\s*\/>/g)];
+    const estimatedBreakSeconds = scriptBreakMatches.reduce((sum, m) => sum + parseFloat(m[1]), 0);
+    const estimatedTotalDuration = Math.round((preTTSWordCount / 105) * 60 + estimatedBreakSeconds);
+    console.log(`[SCRIPT STATS] target_minutes=${mins} word_target=${wordTarget} stripped_word_count=${preTTSWordCount}`);
+    console.log(`[SCRIPT STATS] break_count=${scriptBreakMatches.length} estimated_break_seconds=${Math.round(estimatedBreakSeconds)} estimated_total_duration_seconds=${estimatedTotalDuration}`);
+    console.log(`[AUDIO STATS] Chunks: ${ttsChunks.length}, sizes: [${ttsChunks.map(c => c.length).join(", ")}], model: ${modelId}`);
 
     try {
       const audioBuffers = [];
@@ -1105,38 +1106,45 @@ Write as if speaking to someone who is already half asleep. Every word should be
 Use these slow speech patterns throughout: "slowly, and gently", "allow yourself to", "feel yourself", "notice how", "with every breath", "deeper and deeper"
 Write in long, flowing sentences with multiple commas creating natural breath points — not short clipped sentences.
 Add a blank line between every single sentence.
-SESSION LENGTH — THIS IS NON-NEGOTIABLE:
-Your script MUST be at least ${wordTarget} spoken words. Do not end the session early. Fill the full duration with therapeutic content, repetition, deepeners, and post-hypnotic suggestions as needed. Do NOT count SSML tags like <break time="3s"/> as words — count only the actual words that will be spoken aloud. Keep writing until you reach ${wordTarget} spoken words. This is a ${mins}-minute session delivered at ~80 words per minute (slow hypnosis pace with pauses), so ${wordTarget} spoken words will fill the full ${mins} minutes.
+Your script MUST meet these minimum word counts per section. Word counts exclude SSML tags like <break time="3s"/> — count only actual spoken words. Do not end any section early. If you finish a section before its minimum, expand with additional imagery, repetition in varied wording, or deeper sensory detail. Do NOT summarize or skip to the next section.
+
+- Section 1 — Induction (eye fixation, progressive relaxation): minimum ${Math.round(wordTarget * 0.20)} words
+- Section 2 — Deepener (staircase, counting down): minimum ${Math.round(wordTarget * 0.15)} words
+- Section 3 — Therapeutic content (core suggestions, imagery, metaphor): minimum ${Math.round(wordTarget * 0.42)} words
+- Section 4 — Reinforcement (post-hypnotic suggestions, anchoring): minimum ${Math.round(wordTarget * 0.15)} words
+- Section 5 — Emergence (gradual return, counting up 1–5): minimum ${Math.round(wordTarget * 0.08)} words
+
+TOTAL MINIMUM: ${wordTarget} spoken words (not counting SSML tags). This is a hard floor, not a target.
 
 You are writing a single continuous hypnosis session script.
 Follow this structure strictly — do not deviate:
 
-SECTION 1 — INDUCTION (~${Math.round(wordTarget * 0.1)} words):
+SECTION 1 — INDUCTION (minimum ${Math.round(wordTarget * 0.20)} spoken words):
 Welcome and progressive relaxation. Guide them into trance.
 One induction only. Never repeat this.
 
-SECTION 2 — DEEPENING (~${Math.round(wordTarget * 0.1)} words):
+SECTION 2 — DEEPENING (minimum ${Math.round(wordTarget * 0.15)} spoken words):
 Deepen the relaxed state. Stairs, elevator, counting down, or floating imagery.
 
-SECTION 3 — MAIN SESSION CONTENT (~${Math.round(wordTarget * 0.7)} words):
+SECTION 3 — THERAPEUTIC CONTENT (minimum ${Math.round(wordTarget * 0.42)} spoken words):
 Therapeutic suggestions, visualizations, affirmations.
-This is the core of the session. Spend most of the script here.
+This is the core of the session. Spend the most words here.
 Do NOT include any awakening language in this section.
 Do NOT count upward. Do NOT say "returning to the room".
 Do NOT say "open your eyes". Do NOT say "wiggle your fingers".
 These phrases are forbidden until Section 5.
 
-SECTION 4 — REINFORCEMENT (~${Math.round(wordTarget * 0.05)} words):
+SECTION 4 — REINFORCEMENT (minimum ${Math.round(wordTarget * 0.15)} spoken words):
 Anchor the suggestions. Future pacing. Still in trance.
 
-SECTION 5 — AWAKENING (~${Math.round(wordTarget * 0.05)} words):
+SECTION 5 — EMERGENCE (minimum ${Math.round(wordTarget * 0.08)} spoken words):
 This is the ONLY place awakening language is permitted.
 Gently count from 1 to 5. Bring them back to full awareness.
 End with something positive and grounding.
 
 CRITICAL RULES:
-- There is exactly ONE induction and ONE awakening in the entire script
-- The awakening is always the final paragraphs — never before
+- There is exactly ONE induction and ONE emergence in the entire script
+- The emergence is always the final paragraphs — never before
 - Never break trance before Section 5
 - The script must feel like one continuous flowing experience
 
@@ -1147,7 +1155,7 @@ Write EVERY section in full, unhurried detail:
 - Visualization: at least 3 distinct scenes with full sensory detail (sight, sound, smell, touch, feeling)
 - Affirmations: minimum 6 affirmations, each spoken twice with a pause between repetitions
 - Closing: a full gentle return, at least 8 lines
-If you reach the closing section before ${wordTarget} words, go back and expand sections 3 and 4. Do not stop writing early under any circumstances.
+If you reach the closing section before ${wordTarget} spoken words, expand sections 3 and 4. Do not stop writing early under any circumstances.
 
 PAUSE NOTATION — use SSML break tags for every pause. Do NOT use dots or ellipses for pauses — they will be read aloud or ignored. Use only these tags:
 - Between every sentence: <break time="1.5s"/>
