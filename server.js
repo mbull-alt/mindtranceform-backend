@@ -528,9 +528,9 @@ app.post("/generate-session", requireAuth, async (req, res) => {
   console.log(`[generate] Received: name=${name}, program=${program}, length=${length}, style=${style}, personalization=${personalization}`);
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
   const mins = parseInt(length) || 5;
-  // Per-chunk limit sent to ElevenLabs. Script is split at paragraph boundaries and each
-  // chunk is synthesised separately then concatenated — no content is truncated.
-  const ELEVENLABS_CHUNK_LIMIT = 2500;
+  // Per-chunk limit sent to ElevenLabs. Script is always split into chunks regardless of
+  // total length — each chunk is synthesised separately then concatenated in order.
+  const ELEVENLABS_CHUNK_LIMIT = 2400;
   // Slow hypnosis speech runs at ~95 WPM. This is the sole driver of script length.
   const wordTarget = mins * 95;
   // maxTokens must be large enough to generate the full wordTarget in one AI pass.
@@ -623,7 +623,9 @@ app.post("/generate-session", requireAuth, async (req, res) => {
           console.error(`[elevenlabs] Error ${elevenRes.status} on chunk ${i + 1}: ${errBody}`);
           throw new Error(`ElevenLabs ${elevenRes.status}: ${errBody}`);
         }
-        audioBuffers.push(Buffer.from(await elevenRes.arrayBuffer()));
+        const chunkBuf = Buffer.from(await elevenRes.arrayBuffer());
+        audioBuffers.push(chunkBuf);
+        console.log(`[elevenlabs] Chunk ${i + 1}/${ttsChunks.length}: OK, audio bytes=${chunkBuf.length}`);
       }
       const combined = Buffer.concat(audioBuffers);
       audioBase64 = combined.toString("base64");
@@ -954,7 +956,7 @@ app.get("/sessions/:id/audio", async (req, res) => {
 // ─── TTS HELPERS ─────────────────────────────────────────────────────────────
 // Split an SSML script into chunks of at most maxChars, breaking only on
 // paragraph boundaries so SSML tags are never split mid-tag.
-function splitIntoTTSChunks(text, maxChars = 2500) {
+function splitIntoTTSChunks(text, maxChars = 2400) {
   const paragraphs = text.split(/\n\n+/);
   const chunks = [];
   let current = "";
@@ -1030,14 +1032,37 @@ SESSION LENGTH — THIS IS NON-NEGOTIABLE:
 You MUST write approximately ${wordTarget} words of spoken content (minimum ${Math.ceil(wordTarget * 0.9)} words). Count your words as you write. Do not stop until you reach ${wordTarget} words. This is a ${mins}-minute session — the audio is delivered at ~95 words per minute (slow hypnosis pace) plus SSML pauses between phrases, so ${wordTarget} words will fill the full ${mins} minutes.
 Do NOT include SSML tags in your word count — count only spoken words.
 
-SESSION STRUCTURE — follow this five-part structure precisely, in order:
-1. Opening / relaxation induction — ~${Math.round(wordTarget * 0.1)} words: slow breathing, grounding, initial relaxation
-2. Deepening — ~${Math.round(wordTarget * 0.1)} words: countdown from 10, body scan, progressive relaxation
-3. Main therapeutic content and affirmations — ~${Math.round(wordTarget * 0.7)} words: core goal work, vivid visualization with full sensory detail, repeated affirmations, extended imagery
-4. Reinforcement and future pacing — ~${Math.round(wordTarget * 0.1)} words: anchoring the positive state, imagining carrying this forward
-5. Gentle awakening — ~${Math.round(wordTarget * 0.1)} words: counting up, returning to the room, fully alert
+You are writing a single continuous hypnosis session script.
+Follow this structure strictly — do not deviate:
 
-CRITICAL: Do NOT include any awakening, counting up, or "returning to the room" language until the final section (section 5). The session must flow continuously without breaking trance. Do not write more than one induction. Do not write more than one awakening sequence.
+SECTION 1 — INDUCTION (~${Math.round(wordTarget * 0.1)} words):
+Welcome and progressive relaxation. Guide them into trance.
+One induction only. Never repeat this.
+
+SECTION 2 — DEEPENING (~${Math.round(wordTarget * 0.1)} words):
+Deepen the relaxed state. Stairs, elevator, counting down, or floating imagery.
+
+SECTION 3 — MAIN SESSION CONTENT (~${Math.round(wordTarget * 0.7)} words):
+Therapeutic suggestions, visualizations, affirmations.
+This is the core of the session. Spend most of the script here.
+Do NOT include any awakening language in this section.
+Do NOT count upward. Do NOT say "returning to the room".
+Do NOT say "open your eyes". Do NOT say "wiggle your fingers".
+These phrases are forbidden until Section 5.
+
+SECTION 4 — REINFORCEMENT (~${Math.round(wordTarget * 0.05)} words):
+Anchor the suggestions. Future pacing. Still in trance.
+
+SECTION 5 — AWAKENING (~${Math.round(wordTarget * 0.05)} words):
+This is the ONLY place awakening language is permitted.
+Gently count from 1 to 5. Bring them back to full awareness.
+End with something positive and grounding.
+
+CRITICAL RULES:
+- There is exactly ONE induction and ONE awakening in the entire script
+- The awakening is always the final paragraphs — never before
+- Never break trance before Section 5
+- The script must feel like one continuous flowing experience
 
 Write EVERY section in full, unhurried detail:
 - Opening: 3 full breathing cycles with 4+ lines each
