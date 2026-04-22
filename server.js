@@ -397,7 +397,7 @@ function remuxMp3(inputBuffer) {
       return resolve(inputBuffer);
     }
     exec(
-      `ffmpeg -y -i "${inputPath}" -c:a libmp3lame -b:a 128k -f mp3 "${outputPath}"`,
+      `ffmpeg -y -i "${inputPath}" -af "loudnorm=I=-16:LRA=11:TP=-1.5" -c:a libmp3lame -b:a 128k -f mp3 "${outputPath}"`,
       { timeout: 120000 },
       (err) => {
         if (err) {
@@ -1110,12 +1110,33 @@ app.get("/sessions/:id/audio", async (req, res) => {
   if (error || !data) return res.status(404).send("Session not found");
   if (!data.audio_base64) return res.status(404).send("No audio for this session");
 
-  console.log(`[session/:id/audio] Serving audio for ${req.params.id}, size: ${data.audio_base64.length} chars`);
   const buf = Buffer.from(data.audio_base64, "base64");
+  const total = buf.length;
+  const rangeHeader = req.headers.range;
+
   res.set("Content-Type", "audio/mpeg");
-  res.set("Content-Length", buf.length);
+  res.set("Accept-Ranges", "bytes");
   res.set("Cache-Control", "private, max-age=3600");
-  res.send(buf);
+
+  if (rangeHeader) {
+    // Parse "bytes=start-end" — end is optional, defaults to last byte.
+    const [, startStr, endStr] = rangeHeader.match(/bytes=(\d+)-(\d*)/) || [];
+    const start = parseInt(startStr, 10);
+    const end   = endStr ? parseInt(endStr, 10) : total - 1;
+    if (isNaN(start) || start >= total || end >= total || start > end) {
+      res.set("Content-Range", `bytes */${total}`);
+      return res.status(416).send("Range Not Satisfiable");
+    }
+    const chunkLen = end - start + 1;
+    console.log(`[session/:id/audio] Range ${start}-${end}/${total} for ${req.params.id}`);
+    res.set("Content-Range", `bytes ${start}-${end}/${total}`);
+    res.set("Content-Length", chunkLen);
+    res.status(206).end(buf.slice(start, end + 1));
+  } else {
+    console.log(`[session/:id/audio] Full ${total} bytes for ${req.params.id}`);
+    res.set("Content-Length", total);
+    res.status(200).end(buf);
+  }
 });
 
 app.delete("/sessions/:id", requireAuth, async (req, res) => {
