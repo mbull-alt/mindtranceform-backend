@@ -616,18 +616,25 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       .replace(/\n{3,}/g, "\n\n")          // normalise to at most double newlines
       .trim();
 
-    // Log wordTarget and scriptCharCount as independent values.
-    // wordTarget must never be derived from or capped by scriptCharCount.
     console.log(`wordTarget: ${wordTarget}`);
-    console.log(`scriptCharCount: ${ssmlScript.length}`);
 
     const voiceId = VOICE_MAP[voice] || VOICE_MAP["Female Calm"];
     let audioBase64 = null;
     let audioUnavailable = false;
-    // Split script into chunks and synthesise each separately, then concatenate.
-    // This avoids the per-request character limit truncating long sessions.
+
+    // ── Pre-TTS stats ────────────────────────────────────────────────────────
+    const charsNoTags  = ssmlScript.replace(/<[^>]*>/g, "").length;
+    const charsWithTags = ssmlScript.length;
+    const breakMatches = [...ssmlScript.matchAll(/<break\s+time="([\d.]+)s"\s*\/>/g)];
+    const totalBreakSeconds = breakMatches.reduce((sum, m) => sum + parseFloat(m[1]), 0);
+
     const ttsChunks = splitIntoTTSChunks(ssmlScript, ELEVENLABS_CHUNK_LIMIT);
-    console.log(`[elevenlabs] ${ssmlScript.length} chars split into ${ttsChunks.length} chunk(s) (limit=${ELEVENLABS_CHUNK_LIMIT} each)`);
+    console.log(`[AUDIO STATS] Script chars (no tags): ${charsNoTags}`);
+    console.log(`[AUDIO STATS] Script chars (with tags): ${charsWithTags}`);
+    console.log(`[AUDIO STATS] Chunks: ${ttsChunks.length}`);
+    console.log(`[AUDIO STATS] Chunk sizes: [${ttsChunks.map(c => c.length).join(", ")}]`);
+    console.log(`[AUDIO STATS] Total break time in script: ${totalBreakSeconds}s`);
+
     try {
       const audioBuffers = [];
       for (let i = 0; i < ttsChunks.length; i++) {
@@ -656,7 +663,16 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       }
       const combined = Buffer.concat(audioBuffers);
       audioBase64 = combined.toString("base64");
-      console.log(`[elevenlabs] All ${ttsChunks.length} chunk(s) synthesised, total bytes=${combined.length}`);
+
+      // ── Post-TTS stats ─────────────────────────────────────────────────────
+      const totalBytes = combined.length;
+      const estimatedSecs = Math.round(totalBytes / 16000); // MP3 ~128kbps
+      const estMins = Math.floor(estimatedSecs / 60);
+      const estSecs = estimatedSecs % 60;
+      console.log(`[AUDIO STATS] Audio bytes per chunk: [${audioBuffers.map(b => b.length).join(", ")}]`);
+      console.log(`[AUDIO STATS] Total audio bytes: ${totalBytes}`);
+      console.log(`[AUDIO STATS] Estimated duration: ${estimatedSecs}s (${estMins}:${String(estSecs).padStart(2, "0")})`);
+      console.log(`[elevenlabs] All ${ttsChunks.length} chunk(s) synthesised, total bytes=${totalBytes}`);
     } catch (audioErr) {
       console.error(`[elevenlabs] Audio generation failed: ${audioErr.message}`);
       audioUnavailable = true;
