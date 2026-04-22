@@ -603,8 +603,24 @@ app.post("/generate-session", requireAuth, async (req, res) => {
   // Using mins*300 gives comfortable headroom: 20 min → 6000, 5 min → 2000.
   const maxTokens = Math.max(mins * 300, 2000);
   console.log(`[generate] mins=${mins}, maxTokens=${maxTokens}`);
+
+  // SSE mode: stream progress events as the pipeline advances.
+  // Fallback: if the client doesn't send Accept: text/event-stream, return JSON as before.
+  const useSSE = req.headers.accept?.includes("text/event-stream");
+  let kaTick;
+  if (useSSE) {
+    res.set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
+    res.flushHeaders();
+    kaTick = setInterval(() => { if (!res.writableEnded) res.write(": keepalive\n\n"); }, 30000);
+    res.on("close", () => clearInterval(kaTick));
+  }
+  function emit(data) {
+    if (useSSE && !res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`);
+  }
+
   try {
     const prompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins });
+    emit({ stage: "script_generating", message: "Writing your session..." });
     const aiResponse = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       { model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens, temperature: 0.85 },
@@ -632,6 +648,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     for (let attempt = 0; attempt < 2 && currentWordCount < wordTarget; attempt++) {
       const shortfall = wordTarget - currentWordCount;
       console.log(`[generate] Expansion attempt ${attempt + 1}: ${currentWordCount} spoken words, need ${wordTarget} (shortfall ${shortfall})`);
+      emit({ stage: "script_expanding", attempt: attempt + 1, wordCount: currentWordCount, target: wordTarget, message: "Expanding script..." });
       const expandResponse = await axios.post(
         "https://api.openai.com/v1/chat/completions",
         {
@@ -742,6 +759,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
         // Prepend a silent break to chunk 0 so the model initialises before speaking.
         const chunkText = i === 0 ? '<break time="2s"/> ' + ttsChunks[i] : ttsChunks[i];
         console.log(`[CHUNK ${i + 1}/${ttsChunks.length}] char_count=${chunkText.length} first_80_chars="${chunkText.slice(0, 80).replace(/\n/g, "\\n")}"`);
+        emit({ stage: "synthesizing", chunk: i + 1, totalChunks: ttsChunks.length, message: `Generating voice, ${i + 1} of ${ttsChunks.length}...` });
         const elevenRes = await fetch(
           `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
           {
@@ -773,6 +791,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       // Re-mux concatenated chunks into a single clean CBR MP3 with a proper
       // Xing/Info header — without this the browser reads only the first chunk's
       // metadata and reports the wrong total duration.
+      emit({ stage: "remuxing", message: "Finalizing audio..." });
       const finalAudio = await remuxMp3(rawConcatenated);
       audioBase64 = finalAudio.toString("base64");
 
@@ -811,6 +830,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     console.log(`[session] Audio size: ${audioBase64?.length || 0} chars, unavailable: ${audioUnavailable}`);
     const tentativeId = randomUUID();
     console.log(`[session] Saving session for user ${req.user.id} (${req.user.email})`);
+    emit({ stage: "saving", message: "Almost done..." });
     const { data: insertData, error: insertError } = await supabase.from("sessions").insert({
       id: tentativeId,
       user_id: req.user.id,
@@ -844,11 +864,23 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     // to parse reliably in the browser and causes the result screen to show unavailable.
     const wordCount = currentWordCount;
     const estimatedMinutes = Math.round((wordCount / 95) * 10) / 10;
-    return res.json({ success: true, script: cleanScript, sessionId, audioUnavailable, word_count: wordCount, estimated_minutes: estimatedMinutes });
+    if (useSSE) {
+      emit({ stage: "complete", sessionId, script: cleanScript, audioUnavailable });
+      clearInterval(kaTick);
+      res.end();
+    } else {
+      return res.json({ success: true, script: cleanScript, sessionId, audioUnavailable, word_count: wordCount, estimated_minutes: estimatedMinutes });
+    }
   } catch (err) {
     const message = err?.response?.data?.error?.message || err.message || "Generation failed.";
     console.error("Generation error:", message);
-    return res.status(500).json({ success: false, error: message });
+    if (useSSE) {
+      emit({ stage: "error", message: "Generation failed. Please try again." });
+      clearInterval(kaTick);
+      res.end();
+    } else {
+      return res.status(500).json({ success: false, error: message });
+    }
   }
 });
 
