@@ -633,26 +633,30 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     const totalBreakSeconds = breakMatches.reduce((sum, m) => sum + parseFloat(m[1]), 0);
 
     const ttsChunks = splitIntoTTSChunks(ssmlScript, ELEVENLABS_CHUNK_LIMIT);
+    const modelId = "eleven_multilingual_v2";
+    const voiceSettings = { stability: 0.85, similarity_boost: 0.75, speed: 0.75 };
     console.log(`[AUDIO STATS] Script chars (no tags): ${charsNoTags}`);
     console.log(`[AUDIO STATS] Script chars (with tags): ${charsWithTags}`);
     console.log(`[AUDIO STATS] Chunks: ${ttsChunks.length}`);
     console.log(`[AUDIO STATS] Chunk sizes: [${ttsChunks.map(c => c.length).join(", ")}]`);
     console.log(`[AUDIO STATS] Total break time in script: ${totalBreakSeconds}s`);
+    console.log(`[AUDIO STATS] Model: ${modelId}`);
 
     try {
       const audioBuffers = [];
       for (let i = 0; i < ttsChunks.length; i++) {
-        const chunk = ttsChunks[i];
-        console.log(`[elevenlabs] Chunk ${i + 1}/${ttsChunks.length}: ${chunk.length} chars`);
+        // Prepend a silent break to chunk 0 so the model initialises before speaking.
+        const chunkText = i === 0 ? '<break time="2s"/> ' + ttsChunks[i] : ttsChunks[i];
+        console.log(`[elevenlabs] Chunk ${i + 1}/${ttsChunks.length}: ${chunkText.length} chars`);
         const elevenRes = await fetch(
           `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
           {
             method: "POST",
             headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
             body: JSON.stringify({
-              text: chunk,
-              model_id: "eleven_turbo_v2_5",
-              voice_settings: { stability: 0.75, similarity_boost: 0.75 },
+              text: chunkText,
+              model_id: modelId,
+              voice_settings: voiceSettings,
               output_format: "mp3_44100_128",
             }),
           }
