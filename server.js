@@ -9,6 +9,7 @@ const { randomUUID } = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const rateLimit = require("express-rate-limit");
 dotenv.config();
 
 const { runDailyContentGeneration, runDailyOutreach, runWeeklyContentGeneration } = require("./contentEngine");
@@ -544,13 +545,40 @@ function padAudioToTarget(inputBuffer, targetSeconds) {
   });
 }
 
+// ─── RATE LIMITERS ───────────────────────────────────────────────────────────
+// In-memory store — sufficient for single-instance deployments. Swap for a Redis
+// store (rate-limit-redis) if you go multi-instance.
+
+// Auth endpoints: cap credential-stuffing attempts
+const authLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: "Too many attempts. Please try again in an hour." },
+});
+
+// Generation: 10 per hour per authenticated user — applied after requireAuth so
+// req.user is populated. Admins bypass the limit.
+const generateLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.id || req.ip,
+  skip: (req) => !!req.user?.is_admin,
+  handler: (_req, res) => {
+    res.status(429).json({ success: false, error: "You've generated a lot of sessions recently. Please try again in an hour." });
+  },
+});
+
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => {
   res.json({ message: "Mind Tranceform backend is running", status: "ok" });
 });
 
 // Register user profile + send welcome email
-app.post("/user/register", requireAuth, async (req, res) => {
+app.post("/user/register", authLimiter, requireAuth, async (req, res) => {
   const { id: userId, email } = req.user;
   // Anonymous/guest users have no email — skip profile creation
   if (!email) return res.json({ success: true, guest: true });
@@ -562,7 +590,12 @@ app.post("/user/register", requireAuth, async (req, res) => {
       .single();
 
     if (!existing) {
-      await supabase.from("user_profiles").insert({ user_id: userId, email });
+      const { terms_accepted_at } = req.body || {};
+      await supabase.from("user_profiles").insert({
+        user_id: userId,
+        email,
+        ...(terms_accepted_at ? { terms_accepted_at } : {}),
+      });
       // Fire-and-forget — don't block the response
       sendWelcomeEmail(userId, email).catch(console.error);
     }
@@ -617,11 +650,14 @@ app.post("/verify-payment", async (req, res) => {
   }
 });
 
-app.post("/generate-session", requireAuth, async (req, res) => {
+app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => {
   const { name, goal, program, voice, background, length, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity } = req.body;
   console.log(`[generate] Received: name=${name}, program=${program}, length=${length}, style=${style}, personalization=${personalization}`);
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
-  const mins = parseInt(length) || 5;
+  const mins = Math.min(parseInt(length) || 5, 60);
+  if (parseInt(length) > 60) {
+    console.warn(`[generate] Requested ${length} min — capped at 60`);
+  }
   // Per-chunk limit sent to ElevenLabs. Script is always split into chunks regardless of
   // total length — each chunk is synthesised separately then concatenated in order.
   const ELEVENLABS_CHUNK_LIMIT = 1500;
@@ -2123,69 +2159,7 @@ app.post("/corporate-inquiry", async (req, res) => {
   }
 });
 
-// ─── TESTIMONIALS ────────────────────────────────────────────────────────────
-
-app.post("/testimonial", requireAuth, async (req, res) => {
-  const { user_name, program, rating, message } = req.body;
-  if (!rating || rating < 1 || rating > 5) {
-    return res.status(400).json({ success: false, error: "rating (1–5) required." });
-  }
-  try {
-    await supabase.from("testimonials").insert({
-      user_id:    req.user.id,
-      user_email: req.user.email || null,
-      user_name:  user_name || "Anonymous",
-      program:    program   || null,
-      rating,
-      message:    message   || null,
-      approved:   false,
-    });
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.get("/testimonials", async (_req, res) => {
-  try {
-    const { data, error } = await supabase.from("testimonials")
-      .select("id, user_name, program, rating, message, created_at")
-      .eq("approved", true)
-      .order("created_at", { ascending: false })
-      .limit(6);
-    if (error) {
-      // PGRST205 = table does not exist. Return empty array gracefully rather than crashing.
-      // This prevents a 500 from blocking the app while the table is pending creation.
-      const tableNotFound = error.code === "PGRST205" || error.message?.includes("does not exist");
-      if (tableNotFound) {
-        console.warn("[testimonials] Table not found — returning empty array (PGRST205)");
-        return res.json({ success: true, testimonials: [] });
-      }
-      console.error("[testimonials] Supabase error:", error.message, error);
-      return res.status(500).json({ success: false, error: error.message });
-    }
-    res.json({ success: true, testimonials: data || [] });
-  } catch (err) {
-    // Never let this route return a 500 — an empty list is always a safe fallback
-    console.error("[testimonials] Unhandled exception:", err.message, err);
-    res.json({ success: true, testimonials: [] });
-  }
-});
-
-app.get("/admin/testimonials", requireAdmin, async (_req, res) => {
-  const { data, error } = await supabase.from("testimonials")
-    .select("*")
-    .order("created_at", { ascending: false });
-  if (error) return res.status(500).json({ success: false, error: error.message });
-  res.json({ success: true, testimonials: data || [] });
-});
-
-app.put("/admin/testimonials/:id/approve", requireAdmin, async (req, res) => {
-  const { error } = await supabase.from("testimonials")
-    .update({ approved: true }).eq("id", req.params.id);
-  if (error) return res.status(500).json({ success: false, error: error.message });
-  res.json({ success: true });
-});
+// ─── TESTIMONIALS (removed — table never created; re-add when real data exists) ──
 
 app.post("/admin/grant-access", requireAdmin, async (req, res) => {
   const { email, plan } = req.body;
