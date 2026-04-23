@@ -100,6 +100,7 @@ function emailWrap(body) {
   <div style="text-align:center;padding:24px 0 0;font-size:11px;color:#8a879e;line-height:1.8;">
     <a href="${APP_URL}" style="color:#a8d8c8;text-decoration:none;">Open App</a> &nbsp;·&nbsp;
     You're receiving this because you signed up for Mind Tranceform.
+    &nbsp;·&nbsp; <a href="${APP_URL}/unsubscribe" style="color:#8a879e;text-decoration:none;">Unsubscribe</a>
   </div>
 </td></tr>
 </table></td></tr>
@@ -156,10 +157,24 @@ async function sendWelcomeEmail(userId, email) {
     }
     // Log BEFORE sending — prevents a second concurrent call from passing the DB check
     await logEmail(userId, email, "seq_day0");
+    const welcomeBody = [
+      "Welcome to Mind Tranceform",
+      "",
+      "Your personalized meditation and hypnosis session is ready to create — it takes less than 2 minutes.",
+      "",
+      "Tell us your name and goal. We'll write a script just for you, voice it with AI, and layer it with healing frequencies. It's entirely yours.",
+      "",
+      `Create your session: ${APP_URL}`,
+      "",
+      "You're receiving this because you signed up for Mind Tranceform.",
+      `Unsubscribe: ${APP_URL}/unsubscribe`,
+    ].join("\n");
     const result = await resend.emails.send({
       from: FROM,
+      reply_to: "support@mindtranceformapp.com",
       to: email,
       subject: "Your free session is ready — create it now",
+      text: welcomeBody,
       html: emailWrap(
         h("Welcome to Mind Tranceform") +
         p("Your personalized meditation and hypnosis session is ready to create — it takes less than 2 minutes.") +
@@ -187,11 +202,26 @@ async function sendSessionDeliveryEmail(email, { name, program, voice, script })
     return;
   }
   const previewScript = script.slice(0, 600) + (script.length > 600 ? "..." : "");
+  const deliveryText = [
+    `Your session is ready, ${name}`,
+    "",
+    `Your personalized ${program} session has been created with a ${voice} voice.`,
+    "Open the app to listen, or read your script below.",
+    "",
+    previewScript,
+    "",
+    `Listen in the app: ${APP_URL}`,
+    "",
+    "You're receiving this because you signed up for Mind Tranceform.",
+    `Unsubscribe: ${APP_URL}/unsubscribe`,
+  ].join("\n");
   try {
     const result = await resend.emails.send({
       from: FROM,
+      reply_to: "support@mindtranceformapp.com",
       to: email,
       subject: `Your ${program} session is ready, ${name}`,
+      text: deliveryText,
       html: emailWrap(
         h(`Your session is ready, ${name}`) +
         p(`Your personalized <strong style="color:#e8e6f0;">${program}</strong> session has been created with a <strong style="color:#e8e6f0;">${voice}</strong> voice. Open the app to listen, or read your script below.`) +
@@ -382,9 +412,10 @@ function slowDownAudio(inputBuffer, tempo = 0.5) {
 // ─── MP3 RE-MUX ──────────────────────────────────────────────────────────────
 // Re-encode a concatenated MP3 buffer into a single clean CBR stream with a
 // proper Xing/Info header so the browser reports the correct total duration.
-// Falls back to the raw buffer if ffmpeg is unavailable or fails.
+// Rejects with code REMUX_FAILED on ffmpeg error so the caller can distinguish
+// infrastructure failures from ElevenLabs failures.
 function remuxMp3(inputBuffer) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const tag = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const inputPath  = path.join(os.tmpdir(), `mt_concat_in_${tag}.mp3`);
     const outputPath = path.join(os.tmpdir(), `mt_remux_out_${tag}.mp3`);
@@ -393,17 +424,19 @@ function remuxMp3(inputBuffer) {
       try { fs.unlinkSync(outputPath); } catch {}
     };
     try { fs.writeFileSync(inputPath, inputBuffer); } catch (err) {
-      console.warn("[remux] could not write temp file:", err.message);
-      return resolve(inputBuffer);
+      const e = Object.assign(new Error(`ffmpeg write failed: ${err.message}`), { code: "REMUX_FAILED" });
+      return reject(e);
     }
     exec(
       `ffmpeg -y -i "${inputPath}" -af "loudnorm=I=-16:LRA=11:TP=-1.5" -c:a libmp3lame -b:a 128k -f mp3 "${outputPath}"`,
       { timeout: 120000 },
-      (err) => {
+      (err, _stdout, stderr) => {
         if (err) {
-          console.warn("[remux] ffmpeg re-mux failed — serving raw concat MP3:", err.message);
+          console.error("[remux] ffmpeg failed:", err.message);
+          if (stderr) console.error("[remux] ffmpeg stderr:", stderr.slice(-2000));
           cleanup();
-          return resolve(inputBuffer);
+          const e = Object.assign(new Error(`ffmpeg re-mux failed: ${err.message}`), { code: "REMUX_FAILED", stderr });
+          return reject(e);
         }
         try {
           const remuxed = fs.readFileSync(outputPath);
@@ -411,9 +444,9 @@ function remuxMp3(inputBuffer) {
           console.log(`[remux] complete: ${inputBuffer.length} → ${remuxed.length} bytes`);
           resolve(remuxed);
         } catch (readErr) {
-          console.warn("[remux] could not read ffmpeg output:", readErr.message);
           cleanup();
-          resolve(inputBuffer);
+          const e = Object.assign(new Error(`ffmpeg output unreadable: ${readErr.message}`), { code: "REMUX_FAILED" });
+          reject(e);
         }
       }
     );
@@ -619,19 +652,24 @@ app.post("/generate-session", requireAuth, async (req, res) => {
   }
 
   try {
-    const prompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins });
-    emit({ stage: "script_generating", message: "Writing your session..." });
-    const aiResponse = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      { model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens, temperature: 0.85 },
-      { headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" } }
-    );
-    let rawScript = aiResponse.data.choices[0]?.message?.content?.trim();
-    if (!rawScript) throw new Error("No script returned from AI.");
+    let rawScript;
+    let currentWordCount;
 
-    function countSpokenWords(script) {
-      return script.replace(/<[^>]+>/g, "").trim().split(/\s+/).filter(Boolean).length;
-    }
+    if (process.env.USE_SECTION_GENERATION === "true") {
+      emit({ stage: "script_generating", message: "Writing your session..." });
+      rawScript = await generateSessionSections({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, wordTarget, maxTokens });
+      currentWordCount = countSpokenWords(rawScript);
+      console.log(`[generate] Section-generated spoken words: ${currentWordCount}, Target: ${wordTarget}`);
+    } else {
+      const prompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins });
+      emit({ stage: "script_generating", message: "Writing your session..." });
+      const aiResponse = await axios.post(
+        "https://api.openai.com/v1/chat/completions",
+        { model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: maxTokens, temperature: 0.85 },
+        { headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" } }
+      );
+      rawScript = aiResponse.data.choices[0]?.message?.content?.trim();
+      if (!rawScript) throw new Error("No script returned from AI.");
 
     // ── Diagnostic: log raw LLM output before any processing ─────────────────
     {
@@ -640,7 +678,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
     }
 
     // Validate word count — SSML tags stripped before counting (never count raw script).
-    let currentWordCount = countSpokenWords(rawScript);
+    currentWordCount = countSpokenWords(rawScript);
     console.log(`[generate] Initial spoken words: ${currentWordCount}, Target: ${wordTarget}`);
 
     // Expansion loop: ask LLM to return the full expanded script (not just a continuation).
@@ -705,6 +743,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
         }
       }
     }
+    } // end else (single-call path)
 
     // Normalize malformed SSML break tags from LLM output before TTS.
     // The LLM frequently produces <break time="3s/> (missing closing quote) or
@@ -760,26 +799,7 @@ app.post("/generate-session", requireAuth, async (req, res) => {
         const chunkText = i === 0 ? '<break time="2s"/> ' + ttsChunks[i] : ttsChunks[i];
         console.log(`[CHUNK ${i + 1}/${ttsChunks.length}] char_count=${chunkText.length} first_80_chars="${chunkText.slice(0, 80).replace(/\n/g, "\\n")}"`);
         emit({ stage: "synthesizing", chunk: i + 1, totalChunks: ttsChunks.length, message: `Generating voice, ${i + 1} of ${ttsChunks.length}...` });
-        const elevenRes = await fetch(
-          `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-          {
-            method: "POST",
-            headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
-            body: JSON.stringify({
-              text: chunkText,
-              model_id: modelId,
-              voice_settings: voiceSettings,
-              output_format: "mp3_44100_128",
-            }),
-          }
-        );
-        console.log(`[elevenlabs] Chunk ${i + 1} headers:`, Object.fromEntries(elevenRes.headers.entries()));
-        if (!elevenRes.ok) {
-          const errBody = await elevenRes.text();
-          console.error(`[elevenlabs] Error ${elevenRes.status} on chunk ${i + 1}: ${errBody}`);
-          throw new Error(`ElevenLabs ${elevenRes.status}: ${errBody}`);
-        }
-        const chunkBuf = Buffer.from(await elevenRes.arrayBuffer());
+        const chunkBuf = await synthesizeChunkWithRetry(voiceId, chunkText, modelId, voiceSettings);
         audioBuffers.push(chunkBuf);
         const chunkEstSecs = Math.round(chunkBuf.length / 16000);
         console.log(`[CHUNK ${i + 1} DONE] byte_count=${chunkBuf.length} estimated_seconds=${chunkEstSecs}`);
@@ -815,6 +835,10 @@ app.post("/generate-session", requireAuth, async (req, res) => {
       }
       console.log(`[elevenlabs] All ${ttsChunks.length} chunk(s) synthesised`);
     } catch (audioErr) {
+      if (audioErr.code === "REMUX_FAILED") {
+        console.error(`[remux] Fatal remux error — propagating to outer catch:`, audioErr.message);
+        throw audioErr;
+      }
       console.error(`[elevenlabs] Audio generation failed: ${audioErr.message}`);
       audioUnavailable = true;
     }
@@ -874,8 +898,12 @@ app.post("/generate-session", requireAuth, async (req, res) => {
   } catch (err) {
     const message = err?.response?.data?.error?.message || err.message || "Generation failed.";
     console.error("Generation error:", message);
+    if (err?.stack) console.error("Generation error stack:", err.stack);
+    const userMessage = err?.code === "REMUX_FAILED"
+      ? "Audio processing failed. Please try again or contact support."
+      : "Generation failed. Please try again.";
     if (useSSE) {
-      emit({ stage: "error", message: "Generation failed. Please try again." });
+      emit({ stage: "error", message: userMessage });
       clearInterval(kaTick);
       res.end();
     } else {
@@ -1206,6 +1234,259 @@ function splitIntoTTSChunks(text, maxChars = 1500) {
 }
 
 // ─── PROMPT ───────────────────────────────────────────────────────────────────
+// ─── SHARED HELPERS ──────────────────────────────────────────────────────────
+
+function countSpokenWords(text) {
+  return text.replace(/<[^>]+>/g, "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+// ElevenLabs TTS with exponential-backoff retry (immediate → 1 s → 3 s).
+// Throws with a user-friendly message after all attempts fail.
+async function synthesizeChunkWithRetry(voiceId, chunkText, modelId, voiceSettings) {
+  const DELAYS_MS = [0, 1000, 3000];
+  for (let attempt = 0; attempt < DELAYS_MS.length; attempt++) {
+    if (DELAYS_MS[attempt] > 0) await new Promise(r => setTimeout(r, DELAYS_MS[attempt]));
+    let elevenRes;
+    try {
+      elevenRes = await fetch(
+        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+        {
+          method: "POST",
+          headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
+          body: JSON.stringify({ text: chunkText, model_id: modelId, voice_settings: voiceSettings, output_format: "mp3_44100_128" }),
+        }
+      );
+    } catch (fetchErr) {
+      if (attempt === DELAYS_MS.length - 1)
+        throw new Error("Voice synthesis is temporarily unavailable. Please try again shortly.");
+      console.warn(`[elevenlabs] Network error attempt ${attempt + 1}: ${fetchErr.message} — retrying in ${DELAYS_MS[attempt + 1]}ms`);
+      continue;
+    }
+    if (!elevenRes.ok) {
+      const errBody = await elevenRes.text();
+      if (attempt === DELAYS_MS.length - 1)
+        throw new Error("Voice synthesis is temporarily unavailable. Please try again shortly.");
+      console.warn(`[elevenlabs] HTTP ${elevenRes.status} attempt ${attempt + 1}: ${errBody.slice(0, 200)} — retrying in ${DELAYS_MS[attempt + 1]}ms`);
+      continue;
+    }
+    const buf = Buffer.from(await elevenRes.arrayBuffer());
+    if (!buf.length) {
+      if (attempt === DELAYS_MS.length - 1)
+        throw new Error("Voice synthesis is temporarily unavailable. Please try again shortly.");
+      console.warn(`[elevenlabs] Empty audio attempt ${attempt + 1} — retrying in ${DELAYS_MS[attempt + 1]}ms`);
+      continue;
+    }
+    return buf;
+  }
+}
+
+// ─── SECTION-BY-SECTION SCRIPT GENERATION ────────────────────────────────────
+// Enabled via USE_SECTION_GENERATION=true env var.
+// Runs five focused LLM calls in parallel — one per session section — then
+// concatenates them. Retries any section that is >20 % under its word budget.
+
+const SSML_RULES = `PAUSE NOTATION — use only SSML break tags, never dots or ellipses:
+- Between sentences: <break time="1.5s"/>
+- After breathing instructions: <break time="3s"/>
+- After each countdown number: <break time="3s"/>
+- After each affirmation: <break time="2s"/>
+- Between major moments: <break time="2.5s"/>
+
+BREATHING FORMAT (write exactly like this):
+Breathe in, slowly, through your nose <break time="3s"/> and hold it gently <break time="2s"/> now breathe out, slowly, through your mouth <break time="3s"/> feel your body sink deeper into relaxation <break time="2s"/>
+
+COUNTDOWN FORMAT (write each number like this):
+Ten <break time="3s"/> allow yourself to sink deeper <break time="2s"/>
+Nine <break time="3s"/> deeper still <break time="2s"/>
+
+RULES: No stage directions. No parenthetical marks like (pause) or (breathe). No dots or ellipses. Output ONLY spoken words and <break> tags. No section headers or labels. Write in second person, slow flowing sentences with long vowels and natural breath points.`;
+
+function buildSectionPrompt(section, budget, ctx) {
+  const { name, goal, program, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle } = ctx;
+
+  const hasDeepQ  = personalization === "deep" && (deepQ1 || deepQ2 || deepQ3 || deepQ4);
+  const hasLegacy = personalization === "deep" && (fears || motivation || idealLife);
+  const deepCtx = hasDeepQ
+    ? [deepQ1, deepQ2, deepQ3, deepQ4].filter(Boolean).map(q => `- ${q}`).join("\n")
+    : hasLegacy
+    ? [fears && `Fear/release: ${fears}`, motivation && `Motivation: ${motivation}`, idealLife && `Ideal life: ${idealLife}`].filter(Boolean).join("\n")
+    : "";
+
+  const affirmGuide = {
+    "I am":          'Use "I am…" affirmations.',
+    "You are":       'Use "You are…" affirmations.',
+    "Present tense": "Write affirmations as present-tense truths.",
+    "Future tense":  "Write affirmations as future certainties.",
+  }[affirmationStyle] || 'Use "I am…" affirmations.';
+
+  const footer = `MINIMUM: ${budget} spoken words (SSML tags do not count). Hard floor — expand with more imagery or repetition if you finish early.
+
+${SSML_RULES}
+
+User: ${name} | Goal: "${goal}" | Program: ${program} | Style: ${style || "Gentle Meditation"}${deepCtx ? `\nDeep personalization:\n${deepCtx}` : ""}`;
+
+  const endings = {
+    "Sleep":                "End this section with gentle drifting-toward-sleep suggestions.",
+    "Stress & Anxiety":     "End with a calming positive anchor for the rest of the day.",
+    "Abundance":            "End with vivid visualization of receiving abundance.",
+    "Confidence":           "End with a surge of inner certainty and unstoppable self-belief.",
+    "Focus & Productivity": "End with a sharp, energized state of clear mental focus.",
+    "Quit Smoking":         "End with vivid freedom, clean lungs, and deep pride.",
+    "Weight Loss Mindset":  "End with a positive body image and vibrant health visualization.",
+    "Relationship Healing": "End with an open heart and readiness for love.",
+    "Abundance & Wealth":   "End with a vivid felt sense of financial freedom and certainty.",
+  };
+
+  switch (section) {
+    case "induction":
+      return `Write the INDUCTION section of a personalized hypnosis session for ${name}.
+
+This is the first thing the listener hears. Your job:
+1. Welcome ${name} warmly and invite them to settle in
+2. Lead exactly 3 complete breathing cycles using the breathing format below
+3. Guide a progressive body scan from head to toe (at least 2 sentences per region: scalp, face, neck, shoulders, chest, arms, hands, belly, lower back, hips, legs, feet)
+4. Use eye-fixation or downward-gaze suggestions to begin inducing trance
+5. End with ${name} feeling heavy, warm, and deeply ready to go further
+
+Do NOT include any countdown, therapeutic suggestions, or awakening language — those come later.
+The next section will count ${name} down from 10 to 1.
+
+${footer}`;
+
+    case "deepener":
+      return `Write the DEEPENER section of a personalized hypnosis session for ${name}.
+
+${name} just completed a relaxation induction and is already calm but not yet in deep trance.
+Your job: deepen their trance state significantly using a countdown.
+
+1. Open with 1–2 transition sentences ("And as you go deeper now…")
+2. Count DOWN from 10 to 1 using the countdown format below — after each number write 3–4 lines of deepening suggestions
+3. Weave in vivid imagery: a warm staircase descending, a peaceful elevator, a soft cloud
+4. End with ${name} in profound, receptive stillness
+
+Do NOT repeat the body scan or breathing exercises from the previous section.
+Do NOT include therapeutic suggestions — those come next.
+
+${footer}`;
+
+    case "therapeutic":
+      return `Write the THERAPEUTIC CONTENT section of a personalized hypnosis session for ${name}.
+
+${name} is in deep trance and maximally receptive. This is the core and longest section.
+Your job: deliver deeply personalized therapeutic suggestions for the program "${program}".
+
+1. Open with 2 sentences acknowledging how deeply relaxed ${name} is
+2. Deliver core program suggestions: vivid visualizations, metaphors, and affirmations tied to "${goal}"
+3. Create at least 3 distinct visualization scenes with full sensory detail (sight, sound, smell, touch, feeling)
+4. Include 6 affirmations tied to "${goal}", each spoken twice with a pause between. ${affirmGuide}
+5. Weave "${goal}" throughout — every suggestion should feel personally written for ${name}
+6. Use repetition and varied wording to reinforce each suggestion
+${endings[program] ? `7. ${endings[program]}` : ""}
+
+CRITICAL: Do NOT include any awakening language. Never say "open your eyes", "returning to the room", "wiggle your fingers", or "wide awake". These are forbidden here.
+
+${footer}`;
+
+    case "reinforcement":
+      return `Write the REINFORCEMENT section of a personalized hypnosis session for ${name}.
+
+The therapeutic suggestions have just been delivered. ${name} is still in deep trance.
+Your job: anchor the suggestions as permanent, automatic changes.
+
+1. Create a post-hypnotic anchor: a word or sensation that recalls these feelings ("Every time you take a deep breath and say to yourself…")
+2. Future-pace: describe how ${name} will feel and act in the coming days and weeks
+3. Reinforce that the changes are real, already taking root, and growing stronger daily
+4. Use a bridge phrase: "From this moment forward…" or "With every passing day…"
+5. End with profound completion and quiet confidence
+
+Do NOT include awakening language — that comes in the very next and final section.
+
+${footer}`;
+
+    case "emergence":
+      return `Write the EMERGENCE section of a personalized hypnosis session for ${name}.
+
+All suggestions have been delivered. Your job: gently return ${name} to full waking awareness.
+
+1. Begin: "In a moment, I'll count from 1 to 5…"
+2. Count 1 to 5 — each number brings more alertness (1 = deeply relaxed, 5 = fully alert and refreshed)
+3. After each number, add 2–3 sentences of returning awareness and positive reinforcement
+4. At 5, ${name} opens their eyes feeling refreshed, energized, and deeply well
+5. End with a warm, grounding close
+
+This is the ONLY section where awakening language is permitted.
+Do NOT add more therapeutic suggestions — that work is complete.
+
+${footer}`;
+
+    default:
+      throw new Error(`Unknown section: ${section}`);
+  }
+}
+
+async function generateSessionSections({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, wordTarget, maxTokens }) {
+  const budgets = {
+    induction:     Math.round(wordTarget * 0.20),
+    deepener:      Math.round(wordTarget * 0.15),
+    therapeutic:   Math.round(wordTarget * 0.40),
+    reinforcement: Math.round(wordTarget * 0.15),
+    emergence:     Math.round(wordTarget * 0.10),
+  };
+  const ctx = { name, goal, program, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle };
+  const headers = { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" };
+
+  async function callSection(section, budget, isRetry = false) {
+    const prompt = buildSectionPrompt(section, budget, ctx);
+    let text;
+    try {
+      const res = await axios.post(
+        "https://api.openai.com/v1/chat/completions",
+        { model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: Math.max(Math.ceil(budget * 2.5), 1000), temperature: 0.85 },
+        { headers }
+      );
+      text = res.data.choices[0]?.message?.content?.trim();
+    } catch (err) {
+      if (!isRetry) { console.warn(`[section/${section}] LLM error, retrying: ${err.message}`); return callSection(section, budget, true); }
+      throw new Error("We couldn't write your script right now. Please try again in a minute.");
+    }
+    if (!text) {
+      if (!isRetry) { console.warn(`[section/${section}] Empty response, retrying`); return callSection(section, budget, true); }
+      throw new Error("We couldn't write your script right now. Please try again in a minute.");
+    }
+    return text;
+  }
+
+  console.log(`[section] Parallel generation: ${JSON.stringify(budgets)}`);
+  const [induction, deepener, therapeutic, reinforcement, emergence] = await Promise.all([
+    callSection("induction",     budgets.induction),
+    callSection("deepener",      budgets.deepener),
+    callSection("therapeutic",   budgets.therapeutic),
+    callSection("reinforcement", budgets.reinforcement),
+    callSection("emergence",     budgets.emergence),
+  ]);
+
+  const sections = { induction, deepener, therapeutic, reinforcement, emergence };
+
+  // Retry sections that are >20 % under their word budget (in parallel).
+  const retryKeys = Object.entries(budgets)
+    .filter(([k, b]) => { const wc = countSpokenWords(sections[k]); console.log(`[section/${k}] ${wc} words (target ${b}, ${Math.round(wc/b*100)}%)`); return wc / b < 0.80; })
+    .map(([k]) => k);
+
+  if (retryKeys.length > 0) {
+    console.warn(`[section] Retrying under-target sections: ${retryKeys.join(", ")}`);
+    const retried = await Promise.all(retryKeys.map(k => callSection(k, budgets[k], true)));
+    retryKeys.forEach((k, i) => { sections[k] = retried[i]; console.log(`[section/${k}] After retry: ${countSpokenWords(sections[k])} words`); });
+  }
+
+  const total = Object.values(sections).reduce((s, t) => s + countSpokenWords(t), 0);
+  console.log(`[section] Total spoken words: ${total} (target ${wordTarget}, ${Math.round(total/wordTarget*100)}%)`);
+
+  return ["induction", "deepener", "therapeutic", "reinforcement", "emergence"]
+    .map(k => sections[k])
+    .join('\n\n<break time="3s"/>\n\n');
+}
+
+// ─── PROMPT (single-call fallback) ───────────────────────────────────────────
 function buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget = 400, mins = 5 }) {
   const endings = {
     "Sleep":                "End with suggestions to drift into deep restful sleep. Do NOT include a wake-up.",
