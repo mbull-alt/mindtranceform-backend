@@ -13,6 +13,8 @@ const rateLimit = require("express-rate-limit");
 dotenv.config();
 
 const { runDailyContentGeneration, runDailyOutreach, runWeeklyContentGeneration } = require("./contentEngine");
+const { classifyPrompt } = require("./safety/topicClassifier");
+const { llmIntentCheck } = require("./safety/intentClassifier");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -654,6 +656,59 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
   const { name, goal, program, voice, background, length, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity } = req.body;
   console.log(`[generate] Received: name=${name}, program=${program}, length=${length}, style=${style}, personalization=${personalization}`);
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
+
+  // ─── SAFETY CLASSIFICATION ─────────────────────────────────────────────────
+  const BLOCKED_MESSAGE = "We're not able to generate a session for this topic. Mind Tranceform is designed for relaxation and personal growth — for support with this topic, please reach out to a licensed therapist or counselor.";
+  const notes = [personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4].filter(Boolean).join(" ");
+
+  // Layer 1: synchronous keyword classifier (~0ms)
+  const layer1 = classifyPrompt(goal, notes);
+
+  function logSafetyEvent({ action, layer, originalGoal, resolvedGoal, reason }) {
+    supabase.from("safety_events").insert({
+      user_id: req.user.id,
+      action,
+      layer,
+      original_goal: originalGoal,
+      resolved_goal: resolvedGoal || null,
+      reason,
+    }).then(({ error }) => { if (error) console.error("[safety] log error:", error.message); });
+  }
+
+  if (layer1.action === "block") {
+    logSafetyEvent({ action: "block", layer: "keyword", originalGoal: goal, reason: layer1.reason });
+    return res.status(422).json({ error: "topic_blocked", message: BLOCKED_MESSAGE, suggestProfessional: true });
+  }
+
+  let resolvedGoal = goal;
+  let steered = false;
+
+  if (layer1.action === "steer") {
+    resolvedGoal = layer1.steerTo;
+    steered = true;
+    logSafetyEvent({ action: "steer", layer: "keyword", originalGoal: goal, resolvedGoal, reason: "keyword match" });
+  } else {
+    // Layer 2: LLM intent classifier (only when keyword layer allows)
+    const layer2 = await llmIntentCheck(goal, notes);
+    console.log(`[safety/llm] category=${layer2.category} reason="${layer2.reason}"`);
+
+    if (layer2.category === "block") {
+      logSafetyEvent({ action: "block", layer: "llm", originalGoal: goal, reason: layer2.reason });
+      return res.status(422).json({ error: "topic_blocked", message: BLOCKED_MESSAGE, suggestProfessional: true });
+    }
+
+    if (layer2.category === "steer") {
+      resolvedGoal = layer2.steerTo || goal;
+      steered = true;
+      logSafetyEvent({ action: "steer", layer: "llm", originalGoal: goal, resolvedGoal, reason: layer2.reason });
+    }
+  }
+
+  if (steered) {
+    console.log(`[safety] steered goal: "${goal}" → "${resolvedGoal}"`);
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
+
   const mins = Math.min(parseInt(length) || 5, 60);
   if (parseInt(length) > 60) {
     console.warn(`[generate] Requested ${length} min — capped at 60`);
@@ -693,11 +748,11 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
 
     if (process.env.USE_SECTION_GENERATION === "true") {
       emit({ stage: "script_generating", message: "Writing your session..." });
-      rawScript = await generateSessionSections({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, wordTarget, maxTokens });
+      rawScript = await generateSessionSections({ name, goal: resolvedGoal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, wordTarget, maxTokens });
       currentWordCount = countSpokenWords(rawScript);
       console.log(`[generate] Section-generated spoken words: ${currentWordCount}, Target: ${wordTarget}`);
     } else {
-      const prompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins });
+      const prompt = buildPrompt({ name, goal: resolvedGoal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins });
       emit({ stage: "script_generating", message: "Writing your session..." });
       const aiResponse = await axios.post(
         "https://api.openai.com/v1/chat/completions",
@@ -762,7 +817,7 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
       .findIndex(p => awakeningPhrases.some(phrase => p.toLowerCase().includes(phrase)));
     if (earlyAwakeningIndex !== -1) {
       console.warn(`[SCRIPT VALIDATION] Awakening language found in paragraph ${earlyAwakeningIndex + 1}/${validationParagraphs.length} (safe zone starts at ${safeZoneStart}) — regenerating`);
-      const correctionPrompt = buildPrompt({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins })
+      const correctionPrompt = buildPrompt({ name, goal: resolvedGoal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins })
         + `\n\nIMPORTANT: Your previous attempt contained awakening language mid-session. Do not repeat this. Also, you MUST write the full ${wordTarget} words — do not write a shorter script.`;
       const regenResponse = await axios.post(
         "https://api.openai.com/v1/chat/completions",
@@ -1564,7 +1619,9 @@ function buildPrompt({ name, goal, program, voice, background, style, personaliz
     ? `\nDeep personalization:\n${fears ? `- Fear / what to release: ${fears}` : ""}\n${motivation ? `- Core motivation: ${motivation}` : ""}\n${idealLife ? `- Ideal life vision: ${idealLife}` : ""}`.trim()
     : "";
 
-  return `Write a personalized guided ${program} meditation/hypnosis session.
+  return `SAFETY INSTRUCTION: You are generating guided meditation and hypnosis scripts for relaxation and personal growth only. If the session goal touches on clinical mental health treatment, self-harm, substance dependency treatment, or medical therapy, gently reframe the session toward relaxation, self-compassion, and general wellbeing instead. Never position the session as a substitute for professional care.
+
+Write a personalized guided ${program} meditation/hypnosis session.
 Name: ${name}
 Goal: ${goal}
 Program: ${program}
