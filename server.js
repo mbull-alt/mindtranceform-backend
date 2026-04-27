@@ -2295,6 +2295,92 @@ app.get("/blog/posts/:slug", async (req, res) => {
   res.json({ success: true, post: data });
 });
 
+// One-time cleanup: delete AI-generated drafts that were produced by the
+// now-disabled content cron jobs. Also backfills source='auto' if the column
+// has been added via migrations/add-source-column.sql.
+app.post("/admin/cleanup-drafts", requireAdmin, async (req, res) => {
+  const counts = {};
+  const errors = [];
+
+  async function del(label, filters) {
+    try {
+      let countQ = supabase.from("content_calendar").select("id", { count: "exact", head: true });
+      for (const [k, v] of Object.entries(filters)) countQ = countQ.eq(k, v);
+      const { count } = await countQ;
+      if (!count) { counts[label] = 0; return; }
+      let delQ = supabase.from("content_calendar").delete();
+      for (const [k, v] of Object.entries(filters)) delQ = delQ.eq(k, v);
+      const { error } = await delQ;
+      if (error) { errors.push(`${label}: ${error.message}`); return; }
+      counts[label] = count;
+    } catch (e) { errors.push(`${label}: ${e.message}`); }
+  }
+
+  await del("reddit",         { type: "reddit" });
+  await del("reddit_reply",   { type: "reddit_reply", status: "draft" });
+  await del("twitter_draft",  { type: "twitter",       status: "draft" });
+  await del("twitter_reply",  { type: "twitter_reply", status: "draft" });
+  await del("tiktok_draft",   { type: "tiktok",        status: "draft" });
+
+  // Verify zeros
+  const { count: redditLeft }  = await supabase.from("content_calendar").select("id", { count: "exact", head: true }).eq("type", "reddit");
+  const { count: twitterLeft } = await supabase.from("content_calendar").select("id", { count: "exact", head: true }).eq("type", "twitter").eq("status", "draft");
+  const { count: tiktokLeft }  = await supabase.from("content_calendar").select("id", { count: "exact", head: true }).eq("type", "tiktok").eq("status", "draft");
+  const { count: totalLeft }   = await supabase.from("content_calendar").select("id", { count: "exact", head: true });
+
+  // Backfill source column if it exists
+  let backfill = "skipped — source column not yet added (apply migrations/add-source-column.sql first)";
+  try {
+    const { error: bErr } = await supabase.from("content_calendar").update({ source: "auto" }).is("source", null);
+    if (!bErr) backfill = "complete";
+    else if (bErr.message.includes("source")) backfill = "skipped — column not yet added";
+    else backfill = `error: ${bErr.message}`;
+  } catch {}
+
+  const totalDeleted = Object.values(counts).reduce((a, b) => a + b, 0);
+  console.log("[admin/cleanup-drafts] deleted:", counts, "remaining:", { redditLeft, twitterLeft, tiktokLeft, totalLeft });
+
+  res.json({
+    success: errors.length === 0,
+    deleted: { ...counts, total: totalDeleted },
+    remaining: { reddit: redditLeft, twitter_draft: twitterLeft, tiktok_draft: tiktokLeft, total: totalLeft },
+    verification: { reddit_zero: redditLeft === 0, twitter_draft_zero: twitterLeft === 0, tiktok_draft_zero: tiktokLeft === 0 },
+    source_backfill: backfill,
+    errors,
+  });
+});
+
+// Send a test drip email (bypasses dedup log — admin pipeline verification only)
+app.post("/admin/test-email", requireAdmin, async (req, res) => {
+  const { to, day = 0 } = req.body || {};
+  if (!to) return res.status(400).json({ success: false, error: "to is required" });
+  const resendClient = getResendClient();
+  if (!resendClient) return res.status(500).json({ success: false, error: "RESEND_API_KEY not set" });
+  try {
+    let subject, html;
+    if (Number(day) === 0) {
+      subject = "[TEST] Your free session is ready — create it now";
+      html = emailWrap(
+        h("Welcome to Mind Tranceform") +
+        p("This is a test of the Day 0 welcome email. The email pipeline is working correctly.") +
+        cta("Create My Session ✦", APP_URL)
+      );
+    } else {
+      subject = `[TEST] Day ${day} drip email`;
+      html = emailWrap(
+        h(`Day ${day} Drip — Pipeline Test`) +
+        p(`This is a test of the Day ${day} sequence email. The email pipeline is working correctly.`)
+      );
+    }
+    const result = await resendClient.emails.send({ from: FROM, to, subject, html });
+    console.log(`[admin/test-email] sent day=${day} to=${to} id=${result?.data?.id}`);
+    res.json({ success: true, to, day, id: result?.data?.id });
+  } catch (err) {
+    console.error("[admin/test-email] failed:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.post("/admin/blog/generate", requireAdmin, async (req, res) => {
   try {
     const result = await require("./contentEngine").generateBlogPost();
@@ -2332,37 +2418,29 @@ function verifyCron(req, res) {
   return true;
 }
 
-app.post("/cron/daily-content", async (req, res) => {
+// DISABLED 2026-04-27 — Reddit post generator, TikTok scripts, Twitter posts,
+// and email subject line generation were producing brand-damaging AI-shill
+// content. Functions remain in contentEngine.js for potential future reuse.
+app.post("/cron/daily-content", (req, res) => {
   if (!verifyCron(req, res)) return;
-  try {
-    const summary = await runDailyContentGeneration();
-    res.json({ success: true, ...summary });
-  } catch (err) {
-    console.error("Cron daily-content error:", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
+  console.warn("[cron/daily-content] DISABLED — auto-content generation is off");
+  res.status(410).json({ success: false, disabled: true, reason: "auto-content generation disabled" });
 });
 
-app.post("/cron/daily-outreach", async (req, res) => {
+// DISABLED 2026-04-27 — Reddit outreach bot and Twitter engagement reply
+// finder. Functions remain in contentEngine.js for potential future reuse.
+app.post("/cron/daily-outreach", (req, res) => {
   if (!verifyCron(req, res)) return;
-  try {
-    const summary = await runDailyOutreach();
-    res.json({ success: true, ...summary });
-  } catch (err) {
-    console.error("Cron daily-outreach error:", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
+  console.warn("[cron/daily-outreach] DISABLED — outreach bots are off");
+  res.status(410).json({ success: false, disabled: true, reason: "outreach bots disabled" });
 });
 
-app.post("/cron/weekly-content", async (req, res) => {
+// DISABLED 2026-04-27 — SEO blog post auto-generator.
+// Function remains in contentEngine.js for potential future reuse.
+app.post("/cron/weekly-content", (req, res) => {
   if (!verifyCron(req, res)) return;
-  try {
-    const summary = await runWeeklyContentGeneration();
-    res.json({ success: true, ...summary });
-  } catch (err) {
-    console.error("Cron weekly-content error:", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
+  console.warn("[cron/weekly-content] DISABLED — blog auto-generation is off");
+  res.status(410).json({ success: false, disabled: true, reason: "blog auto-generation disabled" });
 });
 
 // ─── RESEND WEBHOOK (email open/click tracking) ───────────────────────────────
