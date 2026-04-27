@@ -1821,6 +1821,19 @@ app.post("/webhook/stripe", async (req, res) => {
             }
           } catch {}
         }
+
+        // PostHog: track trial-to-paid conversion server-side
+        try {
+          const { trackEvent } = require("./posthog");
+          const userId = session.client_reference_id || session.customer_email || "unknown";
+          await trackEvent(userId, "upgrade_completed", {
+            plan:     plan || "unknown",
+            price:    (session.amount_total || 0) / 100,
+            currency: session.currency,
+            source:   "stripe_webhook",
+          });
+        } catch {}
+
         break;
       }
 

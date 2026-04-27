@@ -1,0 +1,50 @@
+name: Supabase Daily Backup
+
+on:
+  schedule:
+    # Runs at 03:00 UTC every day
+    - cron: '0 3 * * *'
+  workflow_dispatch: # allow manual trigger from GitHub UI
+
+jobs:
+  backup:
+    name: Dump & upload Supabase DB
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Install Supabase CLI
+        run: |
+          curl -fsSL https://github.com/supabase/cli/releases/latest/download/supabase_linux_amd64.tar.gz \
+            | tar -xz --strip-components=1 -C /usr/local/bin supabase
+          supabase --version
+
+      - name: Dump database
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+          FILENAME="backup-${TIMESTAMP}.sql.gz"
+          echo "FILENAME=${FILENAME}" >> $GITHUB_ENV
+
+          supabase db dump \
+            --project-ref ${{ secrets.SUPABASE_PROJECT_REF }} \
+            --password    ${{ secrets.SUPABASE_DB_PASSWORD }} \
+            | gzip > "${FILENAME}"
+
+          SIZE=$(du -sh "${FILENAME}" | cut -f1)
+          echo "Backup size: ${SIZE}"
+
+      - name: Upload backup as artifact (90-day retention)
+        uses: actions/upload-artifact@v4
+        with:
+          name: supabase-backup-${{ env.FILENAME }}
+          path: ${{ env.FILENAME }}
+          retention-days: 90
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Supabase backup failed — check the logs above."
+          # Optional: add a curl call to your backend's /webhook or a Slack
+          # webhook URL stored in secrets.SLACK_WEBHOOK_URL
