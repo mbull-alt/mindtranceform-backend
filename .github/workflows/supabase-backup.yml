@@ -31,18 +31,32 @@ jobs:
           DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
           PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
         run: |
+          set -euo pipefail
+
+          # Fail fast if secrets are missing rather than silently dumping nothing.
+          [ -z "${PROJECT_REF}" ] && echo "ERROR: SUPABASE_PROJECT_REF secret is not set" && exit 1
+          [ -z "${DB_PASSWORD}" ] && echo "ERROR: SUPABASE_DB_PASSWORD secret is not set" && exit 1
+
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
           FILENAME="backup-${TIMESTAMP}.sql.gz"
           echo "FILENAME=${FILENAME}" >> "$GITHUB_ENV"
 
           # --project-ref is not a valid flag for supabase db dump in v2.x;
           # use --db-url with the standard Supabase direct connection host instead.
+          # pipefail above ensures a CLI error propagates through the pipe.
           supabase db dump \
             --db-url "postgresql://postgres:${DB_PASSWORD}@db.${PROJECT_REF}.supabase.co:5432/postgres" \
             | gzip > "${FILENAME}"
 
+          # Sanity-check: a real dump is never this small.
+          SIZE_BYTES=$(wc -c < "${FILENAME}")
+          if [ "${SIZE_BYTES}" -lt 500 ]; then
+            echo "ERROR: dump is suspiciously small (${SIZE_BYTES} bytes) — likely a connection or auth failure"
+            exit 1
+          fi
+
           SIZE=$(du -sh "${FILENAME}" | cut -f1)
-          echo "Backup size: ${SIZE}"
+          echo "Backup size: ${SIZE} (${SIZE_BYTES} bytes)"
           echo "BACKUP_SIZE=${SIZE}" >> "$GITHUB_ENV"
 
       - name: Upload backup as artifact (90-day retention)
