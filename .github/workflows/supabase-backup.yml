@@ -11,29 +11,39 @@ jobs:
     name: Dump & upload Supabase DB
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
 
     steps:
+      # Fix: use the official action instead of a broken curl|tar command.
+      # The prior manual install used --strip-components=1 which strips the
+      # filename itself (binary lives at archive root, no subdirectory wrapper),
+      # causing tar to produce no output and exit non-zero every run.
       - name: Install Supabase CLI
-        run: |
-          curl -fsSL https://github.com/supabase/cli/releases/latest/download/supabase_linux_amd64.tar.gz \
-            | tar -xz --strip-components=1 -C /usr/local/bin supabase
-          supabase --version
+        uses: supabase/setup-cli@v2
+        with:
+          version: latest
 
       - name: Dump database
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+          PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
         run: |
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
           FILENAME="backup-${TIMESTAMP}.sql.gz"
-          echo "FILENAME=${FILENAME}" >> $GITHUB_ENV
+          echo "FILENAME=${FILENAME}" >> "$GITHUB_ENV"
 
+          # --project-ref is not a valid flag for supabase db dump in v2.x;
+          # use --db-url with the standard Supabase direct connection host instead.
           supabase db dump \
-            --project-ref ${{ secrets.SUPABASE_PROJECT_REF }} \
-            --password    ${{ secrets.SUPABASE_DB_PASSWORD }} \
+            --db-url "postgresql://postgres:${DB_PASSWORD}@db.${PROJECT_REF}.supabase.co:5432/postgres" \
             | gzip > "${FILENAME}"
 
           SIZE=$(du -sh "${FILENAME}" | cut -f1)
           echo "Backup size: ${SIZE}"
+          echo "BACKUP_SIZE=${SIZE}" >> "$GITHUB_ENV"
 
       - name: Upload backup as artifact (90-day retention)
         uses: actions/upload-artifact@v4
@@ -42,9 +52,60 @@ jobs:
           path: ${{ env.FILENAME }}
           retention-days: 90
 
-      - name: Notify on failure
+      # Success heartbeat: comments in a persistent "Backup health tracker" issue
+      # so silence never reads as success. Also closes any open failure issues.
+      - name: Success heartbeat
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const runUrl = `https://github.com/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            for (const [name, color] of [['backup-health', '0e8a16'], ['backup-failure', 'd93f0b']]) {
+              try { await github.rest.issues.createLabel({ owner, repo, name, color }); } catch(e) {}
+            }
+
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: 'backup-health', per_page: 1
+            });
+
+            const body = `✅ **Backup succeeded** — \`${{ env.FILENAME }}\` (${{ env.BACKUP_SIZE }})\n[Run ${context.runId}](${runUrl})`;
+
+            if (open.length > 0) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: open[0].number, body });
+            } else {
+              await github.rest.issues.create({ owner, repo, title: 'Backup health tracker', body, labels: ['backup-health'] });
+            }
+
+            const { data: failures } = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: 'backup-failure', per_page: 10
+            });
+            for (const i of failures) {
+              await github.rest.issues.update({ owner, repo, issue_number: i.number, state: 'closed' });
+            }
+
+      # Failure alert: opens a GitHub Issue on first failure; adds a comment on
+      # subsequent failures so the issue thread is the audit trail.
+      - name: Failure alert
         if: failure()
-        run: |
-          echo "::error::Supabase backup failed — check the logs above."
-          # Optional: add a curl call to your backend's /webhook or a Slack
-          # webhook URL stored in secrets.SLACK_WEBHOOK_URL
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const runUrl = `https://github.com/${owner}/${repo}/actions/runs/${context.runId}`;
+            try { await github.rest.issues.createLabel({ owner, repo, name: 'backup-failure', color: 'd93f0b' }); } catch(e) {}
+
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: 'backup-failure', per_page: 1
+            });
+
+            const body = `Backup failed — ${new Date().toISOString()}\n[View run](${runUrl})`;
+
+            if (open.length > 0) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: open[0].number, body });
+            } else {
+              await github.rest.issues.create({
+                owner, repo, title: '🚨 Supabase daily backup failing', body, labels: ['backup-failure']
+              });
+            }
