@@ -33,11 +33,11 @@ jobs:
           set -euo pipefail
           [ -z "${PROJECT_REF}" ] && echo "ERROR: SUPABASE_PROJECT_REF secret is not set" && exit 1
           [ -z "${SUPABASE_ACCESS_TOKEN}" ] && echo "ERROR: SUPABASE_ACCESS_TOKEN secret is not set" && exit 1
-          # Create the .temp/project-ref file so the CLI knows which project to dump.
-          # This avoids needing the raw DB password — the CLI generates a temporary
-          # login role via the Management API using the access token instead.
-          mkdir -p supabase/.temp
-          echo "${PROJECT_REF}" > supabase/.temp/project-ref
+          # supabase link writes both .temp/project-ref and .temp/pooler-url.
+          # The pooler URL is IPv4-only; without it the CLI defaults to the direct
+          # host which is IPv6 and unreachable on GitHub Actions runners.
+          # -p "" skips the interactive password prompt; dump uses a temp login role.
+          supabase link --project-ref "${PROJECT_REF}" -p "" --yes
 
       - name: Dump database
         env:
