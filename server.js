@@ -35,14 +35,12 @@ const PORT = process.env.PORT || 8080;
 const stripeClient = stripe(process.env.STRIPE_SECRET_KEY);
 
 app.use(cors());
-// Stripe webhooks require the raw body — all other routes get JSON parsing
-app.use((req, res, next) => {
-  if (req.path === "/webhook/stripe") {
-    express.raw({ type: "application/json" })(req, res, next);
-  } else {
-    express.json({ limit: "10mb" })(req, res, next);
-  }
-});
+// Raw-body parsing for Stripe must run BEFORE the global JSON parser.
+// body-parser skips re-parsing once req._body is set, so registering
+// express.raw() here for the webhook path guarantees constructEvent()
+// receives a Buffer even though express.json() also runs afterwards.
+app.use("/webhook/stripe", express.raw({ type: "application/json" }));
+app.use(express.json({ limit: "10mb" }));
 
 // ─── AUTH MIDDLEWARE ──────────────────────────────────────────────────────────
 async function requireAuth(req, res, next) {
