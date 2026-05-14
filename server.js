@@ -577,6 +577,11 @@ app.get("/", (_req, res) => {
   res.json({ message: "Mind Tranceform backend is running", status: "ok" });
 });
 
+// Keep-alive target for UptimeRobot — prevents Render free-tier sleep.
+app.get("/healthz", (_req, res) => {
+  res.json({ status: "ok" });
+});
+
 // Register user profile + send welcome email
 app.post("/user/register", authLimiter, requireAuth, async (req, res) => {
   const { id: userId, email } = req.user;
@@ -1774,10 +1779,17 @@ app.post("/webhook/stripe", async (req, res) => {
   try {
     event = stripeClient.webhooks.constructEvent(req.body, sig, secret);
   } catch (err) {
-    console.error("Webhook signature error:", err.message);
+    console.error(`[stripe-webhook] signature error: ${err.message}`);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  // Respond to Stripe immediately — their timeout is 30s and Render cold starts
+  // can exceed that. All processing happens asynchronously after the 200 is sent.
+  console.log(`[stripe-webhook] received id=${event.id} type=${event.type}`);
+  res.json({ received: true });
+
+  setImmediate(async () => {
+  const _webhookStart = Date.now();
   try {
     switch (event.type) {
       case "checkout.session.completed": {
@@ -1893,10 +1905,10 @@ app.post("/webhook/stripe", async (req, res) => {
       }
     }
   } catch (err) {
-    console.error("Webhook handler error:", err.message);
+    console.error(`[stripe-webhook] handler error type=${event.type}: ${err.message}`);
   }
-
-  res.json({ received: true });
+  console.log(`[stripe-webhook] processed type=${event.type} in ${Date.now() - _webhookStart}ms`);
+  }); // end setImmediate
 });
 
 // ─── CANCEL SUBSCRIPTION ─────────────────────────────────────────────────────
