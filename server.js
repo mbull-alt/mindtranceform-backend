@@ -1399,11 +1399,11 @@ function buildSectionPrompt(section, budget, ctx) {
   const { name, goal, program, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle } = ctx;
 
   const hasDeepQ  = personalization === "deep" && (deepQ1 || deepQ2 || deepQ3 || deepQ4);
-  const hasLegacy = personalization === "deep" && (fears || motivation || idealLife);
+  const hasLegacy = personalization === "deep" && (fears || idealLife);
   const deepCtx = hasDeepQ
     ? [deepQ1, deepQ2, deepQ3, deepQ4].filter(Boolean).map(q => `- ${q}`).join("\n")
     : hasLegacy
-    ? [fears && `Fear/release: ${fears}`, motivation && `Motivation: ${motivation}`, idealLife && `Ideal life: ${idealLife}`].filter(Boolean).join("\n")
+    ? [fears && `What weighs on them: ${fears}`, idealLife && `What change looks like: ${idealLife}`].filter(Boolean).join("\n")
     : "";
 
   const affirmGuide = {
@@ -1613,13 +1613,13 @@ function buildPrompt({ name, goal, program, voice, background, style, personaliz
     "Immersive": "Weave the background sound throughout as an integral, living part of the experience.",
   };
 
-  // Deep personalization: prefer the program-specific deepQ fields, fall back to legacy fears/motivation/idealLife
+  // Deep personalization: prefer program-specific deepQ fields, fall back to fears/idealLife (two-field form)
   const hasDeepQ = personalization === "deep" && (deepQ1 || deepQ2 || deepQ3 || deepQ4);
-  const hasLegacy = personalization === "deep" && (fears || motivation || idealLife);
+  const hasLegacy = personalization === "deep" && (fears || idealLife);
   const deepContext = hasDeepQ
     ? `\nDeep personalization:\n${deepQ1 ? `- ${deepQ1}` : ""}${deepQ2 ? `\n- ${deepQ2}` : ""}${deepQ3 ? `\n- ${deepQ3}` : ""}${deepQ4 ? `\n- ${deepQ4}` : ""}`.trim()
     : hasLegacy
-    ? `\nDeep personalization:\n${fears ? `- Fear / what to release: ${fears}` : ""}\n${motivation ? `- Core motivation: ${motivation}` : ""}\n${idealLife ? `- Ideal life vision: ${idealLife}` : ""}`.trim()
+    ? `\nDeep personalization:\n${fears ? `- What weighs on them: ${fears}` : ""}${idealLife ? `\n- What change looks like: ${idealLife}` : ""}`.trim()
     : "";
 
   return `SAFETY INSTRUCTION: You are generating guided meditation and hypnosis scripts for relaxation and personal growth only. If the session goal touches on clinical mental health treatment, self-harm, substance dependency treatment, or medical therapy, gently reframe the session toward relaxation, self-compassion, and general wellbeing instead. Never position the session as a substitute for professional care.
