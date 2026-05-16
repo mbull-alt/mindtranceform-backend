@@ -870,6 +870,8 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
     const voiceId = VOICE_MAP[voice] || VOICE_MAP["Female Calm"];
     let audioBase64 = null;
     let audioUnavailable = false;
+    let finalAudio = null;
+    let storageAudioUrl = null;
 
     // ── Diagnostic: state of script entering TTS pipeline ────────────────────
     console.log(`[PRE-CHUNK] char_count=${ssmlScript.length} stripped_word_count=${preTTSWordCount}`);
@@ -906,7 +908,7 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
       // Xing/Info header — without this the browser reads only the first chunk's
       // metadata and reports the wrong total duration.
       emit({ stage: "remuxing", message: "Finalizing audio..." });
-      const finalAudio = await remuxMp3(rawConcatenated);
+      finalAudio = await remuxMp3(rawConcatenated);
       audioBase64 = finalAudio.toString("base64");
 
       // ── Post-TTS duration assertion ────────────────────────────────────────
@@ -947,6 +949,19 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
 
     console.log(`[session] Audio size: ${audioBase64?.length || 0} chars, unavailable: ${audioUnavailable}`);
     const tentativeId = randomUUID();
+    if (finalAudio && !audioUnavailable) {
+      const storagePath = `sessions/${tentativeId}/voice.mp3`;
+      const { error: uploadErr } = await supabase.storage
+        .from("session-audio")
+        .upload(storagePath, finalAudio, { contentType: "audio/mpeg", upsert: true });
+      if (uploadErr) {
+        console.error("[storage] Audio upload failed:", uploadErr.message);
+      } else {
+        storageAudioUrl = supabase.storage.from("session-audio").getPublicUrl(storagePath).data.publicUrl;
+        console.log("[storage] Audio stored:", storagePath);
+        audioBase64 = null;
+      }
+    }
     console.log(`[session] Saving session for user ${req.user.id} (${req.user.email})`);
     emit({ stage: "saving", message: "Almost done..." });
     const { data: insertData, error: insertError } = await supabase.from("sessions").insert({
@@ -957,6 +972,7 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
       program, voice, background,
       script: cleanScript,
       audio_base64: audioBase64,
+      audio_url: storageAudioUrl,
       created_at: new Date().toISOString(),
     }).select("id").single();
     if (insertError) {
@@ -983,11 +999,11 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
     const wordCount = currentWordCount;
     const estimatedMinutes = Math.round((wordCount / 95) * 10) / 10;
     if (useSSE) {
-      emit({ stage: "complete", sessionId, script: cleanScript, audioUnavailable });
+      emit({ stage: "complete", sessionId, script: cleanScript, audioUnavailable, audioUrl: storageAudioUrl });
       clearInterval(kaTick);
       res.end();
     } else {
-      return res.json({ success: true, script: cleanScript, sessionId, audioUnavailable, word_count: wordCount, estimated_minutes: estimatedMinutes });
+      return res.json({ success: true, script: cleanScript, sessionId, audioUnavailable, audioUrl: storageAudioUrl, word_count: wordCount, estimated_minutes: estimatedMinutes });
     }
   } catch (err) {
     const message = err?.response?.data?.error?.message || err.message || "Generation failed.";
@@ -1245,7 +1261,7 @@ app.get("/sessions/:id/audio", async (req, res) => {
 
   let { data, error } = await supabase
     .from("sessions")
-    .select("audio_base64")
+    .select("audio_base64, audio_url")
     .eq("user_id", user.id)
     .eq("id", req.params.id)
     .single();
@@ -1254,7 +1270,7 @@ app.get("/sessions/:id/audio", async (req, res) => {
   if ((error || !data) && user.email) {
     const fb = await supabase
       .from("sessions")
-      .select("audio_base64")
+      .select("audio_base64, audio_url")
       .eq("email", user.email)
       .eq("id", req.params.id)
       .single();
@@ -1262,6 +1278,7 @@ app.get("/sessions/:id/audio", async (req, res) => {
   }
 
   if (error || !data) return res.status(404).send("Session not found");
+  if (data.audio_url) return res.redirect(302, data.audio_url);
   if (!data.audio_base64) return res.status(404).send("No audio for this session");
 
   const buf = Buffer.from(data.audio_base64, "base64");
