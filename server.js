@@ -660,6 +660,23 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
   console.log(`[generate] Received: name=${name}, program=${program}, length=${length}, style=${style}, personalization=${personalization}`);
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
 
+  // ─── GUEST SESSION LIMIT ──────────────────────────────────────────────────
+  // Anonymous users are limited to 1 session lifetime. guest_id is a UUID
+  // stored in the client's localStorage and sent with each generate request.
+  // A determined user can bypass this by clearing their browser, but that's
+  // a far higher friction bar than localStorage alone.
+  if (!req.user.email) {
+    const guestId = req.body.guestId;
+    if (!guestId) {
+      return res.status(403).json({ error: "guest_limit", message: "Guest access requires a valid guest ID. Please refresh and try again." });
+    }
+    const { data: guestRow } = await supabase.from("guest_sessions").select("session_count").eq("guest_id", guestId).single();
+    if (guestRow && guestRow.session_count >= 1) {
+      return res.status(403).json({ error: "guest_limit", message: "You've used your free guest session. Create an account to continue." });
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
+
   // ─── SAFETY CLASSIFICATION ─────────────────────────────────────────────────
   const BLOCKED_MESSAGE = "We're not able to generate a session for this topic. Mind Tranceform is designed for relaxation and personal growth — for support with this topic, please reach out to a licensed therapist or counselor.";
   const notes = [personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4].filter(Boolean).join(" ");
@@ -989,6 +1006,19 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
       .order("created_at", { ascending: false })
       .range(10, 1000);
     if (old?.length) await supabase.from("sessions").delete().in("id", old.map((s) => s.id));
+
+    // Increment guest session count (fire-and-forget)
+    if (!req.user.email && req.body.guestId) {
+      (async () => {
+        const gid = req.body.guestId;
+        const { data: existing } = await supabase.from("guest_sessions").select("session_count").eq("guest_id", gid).single();
+        if (existing) {
+          await supabase.from("guest_sessions").update({ session_count: existing.session_count + 1, last_session_at: new Date().toISOString() }).eq("guest_id", gid);
+        } else {
+          await supabase.from("guest_sessions").insert({ guest_id: gid, session_count: 1, last_session_at: new Date().toISOString() });
+        }
+      })().catch(e => console.error("[guest_sessions] increment failed:", e.message));
+    }
 
     // Send session delivery email (fire-and-forget) — clean script only
     sendSessionDeliveryEmail(req.user.email, { name, program, voice, script: cleanScript }).catch(console.error);
