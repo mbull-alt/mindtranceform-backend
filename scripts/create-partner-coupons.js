@@ -44,21 +44,21 @@ const PARTNER_COUPONS = [
     couponId: "cvn50",
     code: "CVN50",
     maxRedemptions: 250,
-    description: "Cohen Veterans Network pilot — 50% off first month",
+    description: "Cohen Veterans Network - 50% once",
   },
   {
     partner: "The Headstrong Project",
     couponId: "headstrong50",
     code: "HEADSTRONG50",
     maxRedemptions: 100,
-    description: "Headstrong Project pilot — 50% off first month",
+    description: "Headstrong Project - 50% once",
   },
   {
     partner: "Boulder Crest Foundation",
     couponId: "boulder50",
     code: "BOULDER50",
     maxRedemptions: 150,
-    description: "Boulder Crest Foundation pilot — 50% off first month",
+    description: "Boulder Crest Foundation - 50% once",
   },
 ];
 
