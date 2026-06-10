@@ -357,58 +357,6 @@ function cleanScriptForTTS(script) {
     .trim();
 }
 
-// ─── AUDIO TEMPO ─────────────────────────────────────────────────────────────
-// Slow the ElevenLabs audio buffer to `tempo` (0.5 = 50% speed) using
-// ffmpeg's atempo filter, which preserves pitch. Falls back to the original
-// buffer if ffmpeg is unavailable or fails.
-// NOTE: atempo minimum is 0.5. To go slower, chain two filters (e.g. 0.5,0.5 = 0.25x).
-function slowDownAudio(inputBuffer, tempo = 0.5) {
-  return new Promise((resolve) => {
-    const tag = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const inputPath  = path.join(os.tmpdir(), `tts_in_${tag}.mp3`);
-    const outputPath = path.join(os.tmpdir(), `tts_out_${tag}.mp3`);
-
-    const cleanup = () => {
-      try { fs.unlinkSync(inputPath);  } catch {}
-      try { fs.unlinkSync(outputPath); } catch {}
-    };
-
-    try {
-      fs.writeFileSync(inputPath, inputBuffer);
-    } catch (err) {
-      console.warn("[audio] could not write temp file for ffmpeg:", err.message);
-      return resolve(inputBuffer);
-    }
-
-    // For tempo >= 0.5, a single atempo filter is sufficient.
-    // For tempo < 0.5, chain two filters: e.g. atempo=0.5,atempo=0.5 = 0.25x
-    const filterStr = tempo >= 0.5
-      ? `atempo=${tempo}`
-      : `atempo=0.5,atempo=${(tempo / 0.5).toFixed(4)}`;
-
-    exec(
-      `ffmpeg -i "${inputPath}" -filter:a "${filterStr}" -y "${outputPath}"`,
-      { timeout: 60000 },
-      (err) => {
-        if (err) {
-          console.warn("[audio] ffmpeg atempo failed — returning original audio:", err.message);
-          cleanup();
-          return resolve(inputBuffer);
-        }
-        try {
-          const slowed = fs.readFileSync(outputPath);
-          cleanup();
-          console.log(`[audio] ffmpeg atempo=${tempo} applied — ${inputBuffer.length} → ${slowed.length} bytes`);
-          resolve(slowed);
-        } catch (readErr) {
-          console.warn("[audio] could not read ffmpeg output:", readErr.message);
-          cleanup();
-          resolve(inputBuffer);
-        }
-      }
-    );
-  });
-}
 
 // ─── MP3 RE-MUX ──────────────────────────────────────────────────────────────
 // Re-encode a concatenated MP3 buffer into a single clean CBR stream with a
@@ -736,12 +684,12 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
   // Per-chunk limit sent to ElevenLabs. Script is always split into chunks regardless of
   // total length — each chunk is synthesised separately then concatenated in order.
   const ELEVENLABS_CHUNK_LIMIT = 1500;
-  // At speed=0.7 on eleven_multilingual_v2, spoken rate is ~105 WPM.
-  // Break time is estimated at ~6s per minute of session; subtract it from total
-  // time to get the seconds of actual speech needed, then convert to word count.
-  const breakSecondsEstimate = mins * 6;
+  // At speed=0.82 on eleven_multilingual_v2, spoken rate is ~120 WPM.
+  // Break time is estimated at ~15s per minute to account for the longer SSML
+  // pause ranges used (breathing 5-6s, countdown 6-8s, sentence 1.5-2.5s).
+  const breakSecondsEstimate = mins * 15;
   const spokenSecondsNeeded = (mins * 60) - breakSecondsEstimate;
-  const wordTarget = Math.round((spokenSecondsNeeded / 60) * 105);
+  const wordTarget = Math.round((spokenSecondsNeeded / 60) * 120);
   // maxTokens: scale with session length; minimum 2000 to prevent cut-off on short sessions.
   // At ~1.3 tokens/word plus SSML overhead, a 1890-word script needs ~3500 tokens minimum.
   // Using mins*300 gives comfortable headroom: 20 min → 6000, 5 min → 2000.
@@ -895,12 +843,12 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
 
     const ttsChunks = splitIntoTTSChunks(ssmlScript, ELEVENLABS_CHUNK_LIMIT);
     const modelId = "eleven_multilingual_v2";
-    const voiceSettings = { stability: 0.85, similarity_boost: 0.75, speed: 0.7 };
+    const voiceSettings = { stability: 0.40, similarity_boost: 0.80, style: 0.20, use_speaker_boost: true, speed: 0.82 };
 
     // ── SCRIPT STATS — ground truth before TTS ────────────────────────────────
     const scriptBreakMatches = [...ssmlScript.matchAll(/<break\s+time="([\d.]+)s"\s*\/>/g)];
     const estimatedBreakSeconds = scriptBreakMatches.reduce((sum, m) => sum + parseFloat(m[1]), 0);
-    const estimatedTotalDuration = Math.round((preTTSWordCount / 105) * 60 + estimatedBreakSeconds);
+    const estimatedTotalDuration = Math.round((preTTSWordCount / 120) * 60 + estimatedBreakSeconds);
     console.log(`[SCRIPT STATS] target_minutes=${mins} word_target=${wordTarget} stripped_word_count=${preTTSWordCount}`);
     console.log(`[SCRIPT STATS] break_count=${scriptBreakMatches.length} estimated_break_seconds=${Math.round(estimatedBreakSeconds)} estimated_total_duration_seconds=${estimatedTotalDuration}`);
     console.log(`[AUDIO STATS] Chunks: ${ttsChunks.length}, sizes: [${ttsChunks.map(c => c.length).join(", ")}], model: ${modelId}`);
@@ -1161,7 +1109,7 @@ app.post("/cron/email-sequences", async (req, res) => {
 const PREVIEW_TEXT = "Take a slow, deep breath in............... and breathe out, slowly............... allow yourself to relax..........";
 const PREVIEW_SETTINGS = {
   model_id: "eleven_multilingual_v2",
-  voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+  voice_settings: { stability: 0.40, similarity_boost: 0.80, style: 0.20, use_speaker_boost: true, speed: 0.82 },
 };
 
 // GET /preview-voice/:voiceName — returns audio/mpeg stream (used by the app)
@@ -1207,7 +1155,7 @@ app.get("/test-elevenlabs", async (_req, res) => {
   try {
     const r = await axios.post(
       "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM",
-      { text: "Test.", model_id: "eleven_multilingual_v2", voice_settings: { stability: 0.5, similarity_boost: 0.75 } },
+      { text: "Test.", model_id: "eleven_multilingual_v2", voice_settings: { stability: 0.40, similarity_boost: 0.80, style: 0.20, use_speaker_boost: true, speed: 0.82 } },
       { headers: { "xi-api-key": key, "Content-Type": "application/json" }, responseType: "arraybuffer" }
     );
     res.json({ ok: true, keyPrefix: key.slice(0, 10) + "...", bytesReceived: r.data.byteLength });
@@ -1426,19 +1374,22 @@ async function synthesizeChunkWithRetry(voiceId, chunkText, modelId, voiceSettin
 // Runs five focused LLM calls in parallel — one per session section — then
 // concatenates them. Retries any section that is >20 % under its word budget.
 
-const SSML_RULES = `PAUSE NOTATION — use only SSML break tags, never dots or ellipses:
-- Between sentences: <break time="1.5s"/>
-- After breathing instructions: <break time="3s"/>
-- After each countdown number: <break time="3s"/>
-- After each affirmation: <break time="2s"/>
-- Between major moments: <break time="2.5s"/>
+const SSML_RULES = `PAUSE NOTATION — use SSML break tags only, never dots or ellipses. Vary pause lengths intentionally — shorter pauses create forward motion, longer ones create space for absorption. The rhythm should feel like a skilled human guide, not a timed recording. Never stack more than one break tag back-to-back.
+
+Pause guidelines:
+- After an ordinary sentence: choose from <break time="1.5s"/> to <break time="2.5s"/> — vary across the session
+- After a key affirmation or central insight: <break time="3s"/> to <break time="4s"/>
+- After a breathing instruction (e.g. "breathe in… hold… breathe out"): <break time="5s"/> to <break time="6s"/>
+- After a visualisation prompt (e.g. "picture a place where you feel safe"): <break time="4s"/> to <break time="5s"/>
+- Countdown numbers (10 to 1): <break time="6s"/> to <break time="8s"/> between each number
+- Deep meditative silence (once or twice per long session at a natural peak): <break time="10s"/> to <break time="12s"/>
 
 BREATHING FORMAT (write exactly like this):
-Breathe in, slowly, through your nose <break time="3s"/> and hold it gently <break time="2s"/> now breathe out, slowly, through your mouth <break time="3s"/> feel your body sink deeper into relaxation <break time="2s"/>
+Breathe in, slowly, through your nose <break time="5s"/> and hold it gently <break time="3s"/> now breathe out, slowly, through your mouth <break time="6s"/> feel your body sink deeper into relaxation <break time="3s"/>
 
 COUNTDOWN FORMAT (write each number like this):
-Ten <break time="3s"/> allow yourself to sink deeper <break time="2s"/>
-Nine <break time="3s"/> deeper still <break time="2s"/>
+Ten <break time="7s"/> allow yourself to sink deeper <break time="2s"/>
+Nine <break time="7s"/> deeper still <break time="2s"/>
 
 RULES: No stage directions. No parenthetical marks like (pause) or (breathe). No dots or ellipses. Output ONLY spoken words and <break> tags. No section headers or labels. Write in second person, slow flowing sentences with long vowels and natural breath points.`;
 
@@ -1735,29 +1686,30 @@ Write EVERY section in full, unhurried detail:
 - Closing: a full gentle return, at least 8 lines
 If you reach the closing section before ${wordTarget} spoken words, expand sections 3 and 4. Do not stop writing early under any circumstances.
 
-PAUSE NOTATION — use SSML break tags for every pause. Do NOT use dots or ellipses for pauses — they will be read aloud or ignored. Use only these tags:
-- Between every sentence: <break time="1.5s"/>
-- After breathing instructions: <break time="3s"/>
-- Between major sections: <break time="2s"/>
-- After each countdown number: <break time="3s"/>
-- After each affirmation: <break time="2s"/>
-- During any countdown or counting sequence, place a <break time="2.5s"/> after each number to allow the listener time to absorb each count.
-Pauses should feel calm and unhurried.
+PAUSE NOTATION — use SSML break tags for every pause. Do NOT use dots or ellipses — they will be read aloud or ignored. Vary pause lengths intentionally to sound like a skilled human guide, not a timed recording. Never stack more than one break tag back-to-back.
+
+Pause guidelines:
+- After an ordinary sentence: choose from <break time="1.5s"/> to <break time="2.5s"/> — vary across the session
+- After a key affirmation or central insight: <break time="3s"/> to <break time="4s"/>
+- After a breathing instruction (e.g. "breathe in… hold… breathe out"): <break time="5s"/> to <break time="6s"/>
+- After a visualisation prompt (e.g. "picture a place where you feel safe"): <break time="4s"/> to <break time="5s"/>
+- Countdown numbers (10 to 1): <break time="6s"/> to <break time="8s"/> between each number
+- Deep meditative silence (once or twice per long session at a natural peak): <break time="10s"/> to <break time="12s"/>
 
 BREATHING INSTRUCTION FORMAT — write the opening breathing section exactly like this:
-Breathe in, slowly, through your nose <break time="3s"/> and hold it gently <break time="2s"/> now breathe out, slowly, through your mouth <break time="3s"/> feel your body sink deeper into relaxation <break time="2s"/>
+Breathe in, slowly, through your nose <break time="5s"/> and hold it gently <break time="3s"/> now breathe out, slowly, through your mouth <break time="6s"/> feel your body sink deeper into relaxation <break time="3s"/>
 
 COUNTDOWN FORMAT — write the countdown exactly like this:
-Ten <break time="3s"/> allow yourself to sink deeper <break time="2s"/>
-Nine <break time="3s"/> deeper still <break time="2s"/>
-Eight <break time="3s"/> more relaxed with every number <break time="2s"/>
-Seven <break time="3s"/> letting go of everything now <break time="2s"/>
-Six <break time="3s"/> peaceful and still <break time="2s"/>
-Five <break time="3s"/> halfway there, sinking beautifully <break time="2s"/>
-Four <break time="3s"/> deeper with every word <break time="2s"/>
-Three <break time="3s"/> almost completely at rest <break time="2s"/>
-Two <break time="3s"/> so deeply relaxed now <break time="2s"/>
-One <break time="3s"/> completely, beautifully still <break time="2s"/>
+Ten <break time="7s"/> allow yourself to sink deeper <break time="2s"/>
+Nine <break time="7s"/> deeper still <break time="2s"/>
+Eight <break time="7s"/> more relaxed with every number <break time="2s"/>
+Seven <break time="7s"/> letting go of everything now <break time="2s"/>
+Six <break time="6s"/> peaceful and still <break time="2s"/>
+Five <break time="6s"/> halfway there, sinking beautifully <break time="2s"/>
+Four <break time="6s"/> deeper with every word <break time="2s"/>
+Three <break time="8s"/> almost completely at rest <break time="2s"/>
+Two <break time="8s"/> so deeply relaxed now <break time="2s"/>
+One <break time="8s"/> completely, beautifully still <break time="2s"/>
 
 Do NOT use any stage directions, labels, or parenthetical instructions like (pause), (breathe), (inhale), (exhale) — these will be read aloud verbatim.
 Do NOT use dots or ellipses (...) anywhere — they are not parsed as pauses by the voice engine. Use only the <break> tags above.
