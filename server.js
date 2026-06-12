@@ -15,6 +15,7 @@ dotenv.config();
 const { runDailyContentGeneration, runDailyOutreach, runWeeklyContentGeneration } = require("./contentEngine");
 const { classifyPrompt } = require("./safety/topicClassifier");
 const { llmIntentCheck } = require("./safety/intentClassifier");
+const { isEntitledToPro, parseCookies, computeDeviceFingerprint, enforceDeviceCap } = require("./creatorAccess");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -358,6 +359,20 @@ function cleanScriptForTTS(script) {
 }
 
 
+// ─── FAST-ENTRY PROGRAM INFERENCE ────────────────────────────────────────────
+function inferProgramFromFreeText(text) {
+  const t = text.toLowerCase();
+  if (/sleep|insomnia|can't rest|lie awake|awake at night|tired.*sleep|fall asleep/.test(t)) return "Sleep";
+  if (/smok|cigarette|tobacco/.test(t)) return "Quit Smoking";
+  if (/weight|overeat|binge.*food|diet|body.*fat|eating habit/.test(t)) return "Weight Loss Mindset";
+  if (/confident|confidence|self.esteem|believe in myself|imposter|not good enough/.test(t)) return "Confidence";
+  if (/focus|concentrate|productiv|procrastinat|distract|adhd|can't focus/.test(t)) return "Focus & Productivity";
+  if (/money|wealth|financial|afford|debt|broke|rich|abundance.*wealth/.test(t)) return "Abundance & Wealth";
+  if (/relationship|heartbreak|breakup|loneli|partner|marriage|love/.test(t)) return "Relationship Healing";
+  if (/abundance|success|manifest|attract|opportu|prosperity/.test(t)) return "Abundance";
+  return "Stress & Anxiety";
+}
+
 // ─── MP3 RE-MUX ──────────────────────────────────────────────────────────────
 // Re-encode a concatenated MP3 buffer into a single clean CBR stream with a
 // proper Xing/Info header so the browser reports the correct total duration.
@@ -604,8 +619,13 @@ app.post("/verify-payment", async (req, res) => {
 });
 
 app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => {
-  const { name, goal, program, voice, background, length, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity } = req.body;
-  console.log(`[generate] Received: name=${name}, program=${program}, length=${length}, style=${style}, personalization=${personalization}`);
+  const { name: rawName, goal: rawGoal, program: rawProgram, voice, background, length, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, pace, free_text_intent } = req.body;
+  const isFastEntry = !!free_text_intent;
+  const name = (rawName || "").trim() || (isFastEntry ? "there" : rawName);
+  const program = isFastEntry ? inferProgramFromFreeText(free_text_intent) : rawProgram;
+  const goal = isFastEntry ? free_text_intent : rawGoal;
+  const inferredProgram = isFastEntry ? program : null;
+  console.log(`[generate] Received: name=${name}, program=${program}, length=${length}, style=${style}, personalization=${personalization}, pace=${pace}, fastEntry=${isFastEntry}`);
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
 
   // ─── GUEST SESSION LIMIT ──────────────────────────────────────────────────
@@ -684,12 +704,12 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
   // Per-chunk limit sent to ElevenLabs. Script is always split into chunks regardless of
   // total length — each chunk is synthesised separately then concatenated in order.
   const ELEVENLABS_CHUNK_LIMIT = 1500;
-  // At speed=0.82 on eleven_multilingual_v2, spoken rate is ~120 WPM.
-  // Break time is estimated at ~15s per minute to account for the longer SSML
-  // pause ranges used (breathing 5-6s, countdown 6-8s, sentence 1.5-2.5s).
-  const breakSecondsEstimate = mins * 15;
-  const spokenSecondsNeeded = (mins * 60) - breakSecondsEstimate;
-  const wordTarget = Math.round((spokenSecondsNeeded / 60) * 120);
+  const WPM_BY_PACE  = { slow: 100, medium: 110, fast: 120 };
+  const SPEED_BY_PACE = { slow: 0.75, medium: 0.82, fast: 0.90 };
+  const normalizedPace = (pace || "slow").toLowerCase();
+  const pacedWpm   = WPM_BY_PACE[normalizedPace]  ?? 100;
+  const pacedSpeed = SPEED_BY_PACE[normalizedPace] ?? 0.75;
+  const wordTarget = Math.round(mins * pacedWpm);
   // maxTokens: scale with session length; minimum 2000 to prevent cut-off on short sessions.
   // At ~1.3 tokens/word plus SSML overhead, a 1890-word script needs ~3500 tokens minimum.
   // Using mins*300 gives comfortable headroom: 20 min → 6000, 5 min → 2000.
@@ -713,6 +733,7 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
   try {
     let rawScript;
     let currentWordCount;
+    let sessionTechnique = null;
 
     if (process.env.USE_SECTION_GENERATION === "true") {
       emit({ stage: "script_generating", message: "Writing your session..." });
@@ -729,6 +750,18 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
       );
       rawScript = aiResponse.data.choices[0]?.message?.content?.trim();
       if (!rawScript) throw new Error("No script returned from AI.");
+
+    // ── Extract technique tag (must come before word-count checks) ────────────
+    {
+      const techMatch = rawScript.match(/^<!--\s*technique:\s*(.+?)\s*-->/i);
+      if (techMatch) {
+        sessionTechnique = techMatch[1].trim();
+        rawScript = rawScript.slice(techMatch[0].length).trimStart();
+        console.log(`[technique] Extracted: "${sessionTechnique}"`);
+      } else {
+        console.warn("[technique] No technique tag found in LLM response");
+      }
+    }
 
     // ── Diagnostic: log raw LLM output before any processing ─────────────────
     {
@@ -843,12 +876,13 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
 
     const ttsChunks = splitIntoTTSChunks(ssmlScript, ELEVENLABS_CHUNK_LIMIT);
     const modelId = "eleven_multilingual_v2";
-    const voiceSettings = { stability: 0.40, similarity_boost: 0.80, style: 0.20, use_speaker_boost: true, speed: 0.82 };
+    const voiceSettings = { stability: 0.40, similarity_boost: 0.80, style: 0.20, use_speaker_boost: true, speed: pacedSpeed };
+    console.log(`[generate] pace=${normalizedPace} speed=${pacedSpeed} wpm=${pacedWpm} wordTarget=${wordTarget}`);
 
     // ── SCRIPT STATS — ground truth before TTS ────────────────────────────────
     const scriptBreakMatches = [...ssmlScript.matchAll(/<break\s+time="([\d.]+)s"\s*\/>/g)];
     const estimatedBreakSeconds = scriptBreakMatches.reduce((sum, m) => sum + parseFloat(m[1]), 0);
-    const estimatedTotalDuration = Math.round((preTTSWordCount / 120) * 60 + estimatedBreakSeconds);
+    const estimatedTotalDuration = Math.round((preTTSWordCount / pacedWpm) * 60 + estimatedBreakSeconds);
     console.log(`[SCRIPT STATS] target_minutes=${mins} word_target=${wordTarget} stripped_word_count=${preTTSWordCount}`);
     console.log(`[SCRIPT STATS] break_count=${scriptBreakMatches.length} estimated_break_seconds=${Math.round(estimatedBreakSeconds)} estimated_total_duration_seconds=${estimatedTotalDuration}`);
     console.log(`[AUDIO STATS] Chunks: ${ttsChunks.length}, sizes: [${ttsChunks.map(c => c.length).join(", ")}], model: ${modelId}`);
@@ -936,6 +970,7 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
       title: `${program} — ${style || "Gentle Meditation"} — ${mins} min`,
       program, voice, background,
       script: cleanScript,
+      technique: sessionTechnique,
       audio_base64: audioBase64,
       audio_url: storageAudioUrl,
       created_at: new Date().toISOString(),
@@ -977,11 +1012,11 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
     const wordCount = currentWordCount;
     const estimatedMinutes = Math.round((wordCount / 95) * 10) / 10;
     if (useSSE) {
-      emit({ stage: "complete", sessionId, script: cleanScript, audioUnavailable, audioUrl: storageAudioUrl });
+      emit({ stage: "complete", sessionId, script: cleanScript, audioUnavailable, audioUrl: storageAudioUrl, inferred_program: inferredProgram, technique: sessionTechnique });
       clearInterval(kaTick);
       res.end();
     } else {
-      return res.json({ success: true, script: cleanScript, sessionId, audioUnavailable, audioUrl: storageAudioUrl, word_count: wordCount, estimated_minutes: estimatedMinutes });
+      return res.json({ success: true, script: cleanScript, sessionId, audioUnavailable, audioUrl: storageAudioUrl, word_count: wordCount, estimated_minutes: estimatedMinutes, inferred_program: inferredProgram, technique: sessionTechnique });
     }
   } catch (err) {
     const message = err?.response?.data?.error?.message || err.message || "Generation failed.";
@@ -1725,27 +1760,67 @@ ${deepContext ? "8" : "7"}. Include 3 personalized affirmations tied directly to
 ${deepContext ? "9" : "8"}. ${endings[program] || "End positively."}
 ${deepContext ? "10" : "9"}. Style: ${styleGuides[style] || styleGuides["Gentle Meditation"]}
 ${deepContext ? "11" : "10"}. Background: ${intensityGuides[backgroundIntensity] || intensityGuides["Balanced"]}
-${deepContext ? "12" : "11"}. Output ONLY the script. No titles, labels, or commentary.`;
+${deepContext ? "12" : "11"}. Output ONLY the script. No titles, labels, or commentary.
+
+TECHNIQUE TAG — you MUST begin your entire response with exactly this format, then immediately write the session script with no blank line between:
+<!-- technique: [one of: Progressive muscle relaxation / Body scan / Guided visualization / Breath-anchored awareness / Hypnotic countdown induction / Positive suggestion loop / EMDR-inspired bilateral / Loving-kindness (metta) / Cognitive defusion / Somatic release] -->
+
+Pick the technique most suited to the program (${program}), style (${style || "Gentle Meditation"}), and user goal. Write the full script directly after this tag.`;
 }
 
 // ─── AUTH VERIFY ─────────────────────────────────────────────────────────────
-// Verifies a Supabase JWT and returns the user's plan + subscription status
+// Verifies a Supabase JWT and returns the user's plan + subscription status.
+// For creator accounts: enforces device cap via httpOnly cookie fingerprint.
 app.post("/auth/verify", requireAuth, async (req, res) => {
   try {
     const { data: profile } = await supabase
       .from("user_profiles")
-      .select("plan, subscription_status, current_period_end, is_subscriber")
+      .select("plan, subscription_status, current_period_end, is_subscriber, creator_access_tier, creator_access_active, creator_access_expires_at, creator_access_device_cap, creator_access_granted_at")
       .eq("user_id", req.user.id)
       .single();
+
+    const entitled = isEntitledToPro(profile);
+
+    // Device cap enforcement for active creator accounts (not paying subscribers)
+    if (profile?.creator_access_active && !profile?.is_subscriber) {
+      const cookies  = parseCookies(req.headers.cookie);
+      const deviceId = cookies["device_id"] || randomUUID();
+      res.cookie("device_id", deviceId, {
+        httpOnly: true,
+        secure:   true,
+        sameSite: "None",
+        maxAge:   365 * 24 * 60 * 60 * 1000,
+      });
+      const fingerprint = computeDeviceFingerprint(req, deviceId);
+      try {
+        await enforceDeviceCap(supabase, req.user.id, fingerprint, profile.creator_access_device_cap || 2);
+      } catch (capErr) {
+        if (capErr.code === "DEVICE_CAP_EXCEEDED") {
+          return res.status(403).json({
+            success: false,
+            error:   "device_cap_exceeded",
+            message: "This creator account has reached its device limit. Contact support to adjust.",
+          });
+        }
+        throw capErr;
+      }
+    }
+
     res.json({
-      success: true,
-      user_id: req.user.id,
-      email:   req.user.email || null,
-      guest:   !req.user.email,
-      plan:    profile?.plan || null,
-      status:  profile?.subscription_status || "free",
-      is_subscriber: profile?.is_subscriber || false,
+      success:            true,
+      user_id:            req.user.id,
+      email:              req.user.email || null,
+      guest:              !req.user.email,
+      plan:               profile?.plan || null,
+      status:             profile?.subscription_status || "free",
+      is_subscriber:      profile?.is_subscriber || false,
+      is_entitled_to_pro: entitled,
       current_period_end: profile?.current_period_end || null,
+      creator_access:     profile?.creator_access_tier ? {
+        tier:       profile.creator_access_tier,
+        expires_at: profile.creator_access_expires_at || null,
+        granted_at: profile.creator_access_granted_at || null,
+      } : null,
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
