@@ -16,6 +16,8 @@ const { runDailyContentGeneration, runDailyOutreach, runWeeklyContentGeneration 
 const { classifyPrompt } = require("./safety/topicClassifier");
 const { llmIntentCheck } = require("./safety/intentClassifier");
 const { isEntitledToPro, parseCookies, computeDeviceFingerprint, enforceDeviceCap } = require("./creatorAccess");
+const { goalLabelForProgram, assessmentTypeForProgram, questionsForType } = require("./lib/goalLabels");
+const { computeStreaks, buildHeatmap, shouldOfferReassessment } = require("./lib/streaks");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -1001,6 +1003,25 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
           await supabase.from("guest_sessions").insert({ guest_id: gid, session_count: 1, last_session_at: new Date().toISOString() });
         }
       })().catch(e => console.error("[guest_sessions] increment failed:", e.message));
+    }
+
+    // Auto-set primary_goal_label from program if the user has none yet (fire-and-forget).
+    // Skips guest sessions (no email) and unknown programs silently.
+    if (req.user.email && req.user.id && program) {
+      (async () => {
+        const label = goalLabelForProgram(program);
+        if (!label) return;
+        const { data: existing } = await supabase
+          .from("user_profiles")
+          .select("primary_goal_label")
+          .eq("user_id", req.user.id)
+          .single();
+        if (!existing?.primary_goal_label) {
+          await supabase.from("user_profiles")
+            .update({ primary_goal_label: label })
+            .eq("user_id", req.user.id);
+        }
+      })().catch(e => console.error("[user_profiles] goal_label set failed:", e.message));
     }
 
     // Send session delivery email (fire-and-forget) — clean script only
@@ -2550,6 +2571,427 @@ app.post("/webhook/resend", express.json(), async (req, res) => {
     res.json({ received: true }); // always 200 to Resend
   }
 });
+
+// ─── EAP AGGREGATE REPORT ────────────────────────────────────────────────────
+// GET /admin/eap-report?from=YYYY-MM-DD&to=YYYY-MM-DD
+//
+// Quarterly anonymised usage summary for EAP / veteran-org partners.
+// No PII is returned — all output is aggregate counts and averages.
+// Requires admin auth (x-admin-key header or admin JWT).
+//
+// Response shape:
+//   period: { from, to }
+//   activeUsers: number          — distinct users with ≥1 session in period
+//   totalSessions: number
+//   avgSessionsPerUser: number
+//   sessionCheckinRate: number   — % of sessions that received a check-in
+//   avgMoodRating: number|null   — mean check-in rating (1–5) across period
+//   moodByWeek: [{ week, avgRating, checkinCount }]
+//   streakBuckets: {             — % of active users whose current streak falls into each bucket
+//     none: number,              — 0 days
+//     short: number,             — 1–6 days
+//     week: number,              — 7–13 days
+//     fortnight: number,         — 14–29 days
+//     month: number              — 30+ days
+//   }
+//   assessmentTrend: {           — users with ≥2 assessments in period
+//     usersWithTwoOrMore: number,
+//     avgFirstScore: number|null,
+//     avgLastScore: number|null,
+//     avgScoreDelta: number|null  — positive = improvement
+//   }
+app.get("/admin/eap-report", requireAdmin, async (req, res) => {
+  const from = req.query.from || new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+  const to   = req.query.to   || new Date().toISOString().slice(0, 10);
+  const fromISO = from + "T00:00:00Z";
+  const toISO   = to   + "T23:59:59Z";
+
+  try {
+    // ── Sessions in period ────────────────────────────────────────────────────
+    const { data: sessions, error: sessErr } = await supabase
+      .from("sessions")
+      .select("id, user_id, created_at")
+      .gte("created_at", fromISO)
+      .lte("created_at", toISO);
+
+    if (sessErr) throw sessErr;
+
+    const sessionIds   = (sessions || []).map((s) => s.id);
+    const userIds      = [...new Set((sessions || []).map((s) => s.user_id).filter(Boolean))];
+    const totalSessions = sessions?.length || 0;
+    const activeUsers   = userIds.length;
+
+    // ── Check-ins for those sessions ─────────────────────────────────────────
+    let checkins = [];
+    if (sessionIds.length > 0) {
+      const { data: ci } = await supabase
+        .from("session_checkins")
+        .select("session_id, rating, created_at")
+        .in("session_id", sessionIds);
+      checkins = ci || [];
+    }
+
+    const sessionCheckinRate = totalSessions > 0
+      ? Math.round((checkins.length / totalSessions) * 1000) / 10   // one decimal %
+      : 0;
+
+    const avgMoodRating = checkins.length > 0
+      ? Math.round((checkins.reduce((s, c) => s + c.rating, 0) / checkins.length) * 100) / 100
+      : null;
+
+    // Weekly mood buckets (ISO week start = Monday)
+    const weekMap = new Map();
+    for (const c of checkins) {
+      const d = new Date(c.created_at);
+      const day = d.getUTCDay(); // 0=Sun
+      const mondayOffset = (day === 0 ? -6 : 1 - day);
+      const monday = new Date(d);
+      monday.setUTCDate(d.getUTCDate() + mondayOffset);
+      const week = monday.toISOString().slice(0, 10);
+      if (!weekMap.has(week)) weekMap.set(week, { sum: 0, count: 0 });
+      weekMap.get(week).sum   += c.rating;
+      weekMap.get(week).count += 1;
+    }
+    const moodByWeek = Array.from(weekMap.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([week, { sum, count }]) => ({
+        week,
+        avgRating: Math.round((sum / count) * 100) / 100,
+        checkinCount: count,
+      }));
+
+    // ── Current-streak buckets for active users ───────────────────────────────
+    // Fetch all historical sessions for each active user to compute current streak.
+    // Done in one query to avoid N+1.
+    let allUserSessions = [];
+    if (userIds.length > 0) {
+      const { data: aus } = await supabase
+        .from("sessions")
+        .select("user_id, created_at")
+        .in("user_id", userIds);
+      allUserSessions = aus || [];
+    }
+
+    const sessionsByUser = new Map();
+    for (const s of allUserSessions) {
+      if (!s.user_id) continue;
+      if (!sessionsByUser.has(s.user_id)) sessionsByUser.set(s.user_id, []);
+      sessionsByUser.get(s.user_id).push(s.created_at);
+    }
+
+    const streakBuckets = { none: 0, short: 0, week: 0, fortnight: 0, month: 0 };
+    for (const uid of userIds) {
+      const ts = sessionsByUser.get(uid) || [];
+      const { currentStreak } = computeStreaks(ts, "UTC");
+      if (currentStreak === 0)      streakBuckets.none++;
+      else if (currentStreak < 7)   streakBuckets.short++;
+      else if (currentStreak < 14)  streakBuckets.week++;
+      else if (currentStreak < 30)  streakBuckets.fortnight++;
+      else                          streakBuckets.month++;
+    }
+    // Convert to percentages (one decimal)
+    const streakPct = {};
+    for (const [k, v] of Object.entries(streakBuckets)) {
+      streakPct[k] = activeUsers > 0 ? Math.round((v / activeUsers) * 1000) / 10 : 0;
+    }
+
+    // ── Self-assessment score delta ───────────────────────────────────────────
+    let assessmentTrend = { usersWithTwoOrMore: 0, avgFirstScore: null, avgLastScore: null, avgScoreDelta: null };
+    if (userIds.length > 0) {
+      const { data: assmts } = await supabase
+        .from("self_assessments")
+        .select("user_id, score, taken_at")
+        .in("user_id", userIds)
+        .gte("taken_at", fromISO)
+        .lte("taken_at", toISO)
+        .order("taken_at", { ascending: true });
+
+      if (assmts?.length) {
+        const byUser = new Map();
+        for (const a of assmts) {
+          if (!byUser.has(a.user_id)) byUser.set(a.user_id, []);
+          byUser.get(a.user_id).push(a.score);
+        }
+        const eligible = [...byUser.values()].filter((scores) => scores.length >= 2);
+        if (eligible.length > 0) {
+          const firstScores = eligible.map((s) => s[0]);
+          const lastScores  = eligible.map((s) => s[s.length - 1]);
+          const avgFirst = firstScores.reduce((s, v) => s + v, 0) / eligible.length;
+          const avgLast  = lastScores.reduce((s, v) => s + v, 0)  / eligible.length;
+          assessmentTrend = {
+            usersWithTwoOrMore: eligible.length,
+            avgFirstScore: Math.round(avgFirst * 100) / 100,
+            avgLastScore:  Math.round(avgLast  * 100) / 100,
+            avgScoreDelta: Math.round((avgLast - avgFirst) * 100) / 100,
+          };
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      period: { from, to },
+      activeUsers,
+      totalSessions,
+      avgSessionsPerUser: activeUsers > 0 ? Math.round((totalSessions / activeUsers) * 100) / 100 : 0,
+      sessionCheckinRate,
+      avgMoodRating,
+      moodByWeek,
+      streakBuckets: streakPct,
+      assessmentTrend,
+    });
+  } catch (err) {
+    console.error("[eap-report] error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── TRACKING, GOALS & SELF-ASSESSMENT ───────────────────────────────────────
+// All endpoints here are:
+//   - requireAuth — no anonymous access
+//   - guest-blocked — !req.user.email returns 403 immediately
+//   - additive only — do not touch onboarding, paywall, or tier gating
+
+// POST /sessions/:id/checkin
+// Optional 1-tap mood rating (1–5) immediately after a session.
+// Skipping means the client simply does not call this endpoint.
+// Upserts on session_id so a double-tap doesn't create duplicate rows.
+app.post("/sessions/:id/checkin", requireAuth, async (req, res) => {
+  if (!req.user.email) {
+    return res.status(403).json({ error: "not_available", message: "Progress tracking is not available for guest sessions." });
+  }
+
+  const rating = Number(req.body?.rating);
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+    return res.status(400).json({ error: "invalid_rating", message: "rating must be an integer between 1 and 5." });
+  }
+
+  const sessionId = req.params.id;
+
+  // Confirm the session belongs to this user before writing
+  const { data: session, error: sessErr } = await supabase
+    .from("sessions")
+    .select("id")
+    .eq("id", sessionId)
+    .eq("user_id", req.user.id)
+    .single();
+
+  if (sessErr || !session) {
+    return res.status(404).json({ error: "session_not_found", message: "Session not found." });
+  }
+
+  const { error } = await supabase.from("session_checkins").upsert(
+    { session_id: sessionId, user_id: req.user.id, rating },
+    { onConflict: "session_id" }
+  );
+
+  if (error) {
+    console.error("[checkin] upsert error:", error.message);
+    return res.status(500).json({ error: "insert_failed", message: error.message });
+  }
+  res.json({ success: true });
+});
+
+// GET /progress
+// Returns streak stats, heatmap, mood trend, and self-assessment trend.
+// Read-only — built entirely from existing sessions + new session_checkins/self_assessments.
+// Accepts optional ?tz=America/Chicago query param for local-timezone streak calculation.
+app.get("/progress", requireAuth, async (req, res) => {
+  if (!req.user.email) {
+    return res.status(403).json({ error: "not_available", message: "Progress tracking is not available for guest sessions." });
+  }
+
+  const tz = req.query.tz || "UTC";
+
+  const { data: sessions, error: sessErr } = await supabase
+    .from("sessions")
+    .select("id, created_at, program")
+    .eq("user_id", req.user.id)
+    .order("created_at", { ascending: false });
+
+  if (sessErr) {
+    console.error("[progress] sessions fetch:", sessErr.message);
+    return res.status(500).json({ error: "fetch_failed", message: sessErr.message });
+  }
+
+  if (!sessions || sessions.length === 0) {
+    return res.json({
+      success: true,
+      totalSessions: 0,
+      currentStreak: 0,
+      longestStreak: 0,
+      heatmap: buildHeatmap([], tz, 90),
+      moodTrend: [],
+      selfAssessmentTrend: [],
+      goalLabel: null,
+    });
+  }
+
+  const timestamps = sessions.map((s) => s.created_at);
+  const { currentStreak, longestStreak } = computeStreaks(timestamps, tz);
+  const heatmap = buildHeatmap(timestamps, tz, 90);
+
+  const [{ data: checkins }, { data: assessments }, { data: profile }] = await Promise.all([
+    supabase
+      .from("session_checkins")
+      .select("rating, created_at")
+      .eq("user_id", req.user.id)
+      .order("created_at", { ascending: true }),
+    supabase
+      .from("self_assessments")
+      .select("score, taken_at, assessment_type")
+      .eq("user_id", req.user.id)
+      .order("taken_at", { ascending: true }),
+    supabase
+      .from("user_profiles")
+      .select("primary_goal_label")
+      .eq("user_id", req.user.id)
+      .single(),
+  ]);
+
+  res.json({
+    success: true,
+    totalSessions: sessions.length,
+    currentStreak,
+    longestStreak,
+    heatmap,
+    moodTrend: (checkins || []).map((c) => ({ date: c.created_at, rating: c.rating })),
+    selfAssessmentTrend: (assessments || []).map((a) => ({
+      date: a.taken_at,
+      score: a.score,
+      type: a.assessment_type,
+    })),
+    goalLabel: profile?.primary_goal_label || null,
+  });
+});
+
+// POST /assessments
+// Submit a non-clinical wellness check-in.
+// responses: { q1: 0–3, q2: 0–3, q3: 0–3, q4: 0–3 }
+// score is computed server-side as sum of q1–q4 (range 0–12, higher = better).
+app.post("/assessments", requireAuth, async (req, res) => {
+  if (!req.user.email) {
+    return res.status(403).json({ error: "not_available", message: "Self-assessments are not available for guest sessions." });
+  }
+
+  const { responses } = req.body || {};
+  if (!responses || typeof responses !== "object" || Array.isArray(responses)) {
+    return res.status(400).json({ error: "invalid_payload", message: "responses must be an object with keys q1–q4." });
+  }
+
+  const answers = ["q1", "q2", "q3", "q4"].map((k) => {
+    const v = Number(responses[k]);
+    return Number.isInteger(v) && v >= 0 && v <= 3 ? v : null;
+  });
+
+  if (answers.some((a) => a === null)) {
+    return res.status(400).json({ error: "invalid_payload", message: "Each of q1–q4 must be an integer 0–3." });
+  }
+
+  const score = answers.reduce((sum, v) => sum + v, 0);
+
+  const { data: lastSession } = await supabase
+    .from("sessions")
+    .select("program")
+    .eq("user_id", req.user.id)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .single();
+
+  const assessmentType = assessmentTypeForProgram(lastSession?.program || "");
+
+  const { error } = await supabase.from("self_assessments").insert({
+    user_id: req.user.id,
+    assessment_type: assessmentType,
+    responses,
+    score,
+  });
+
+  if (error) {
+    console.error("[assessments] insert error:", error.message);
+    return res.status(500).json({ error: "insert_failed", message: error.message });
+  }
+
+  res.json({ success: true, score, assessment_type: assessmentType });
+});
+
+// GET /assessments/status
+// Returns whether the 14-day re-offer banner should be shown, plus the questions
+// the client should render. First-timers get shouldOffer: true.
+app.get("/assessments/status", requireAuth, async (req, res) => {
+  if (!req.user.email) {
+    return res.json({ success: true, hasTaken: false, shouldOffer: false, lastTakenAt: null, questions: [], assessmentType: null });
+  }
+
+  const { data: lastAssessment } = await supabase
+    .from("self_assessments")
+    .select("taken_at, assessment_type")
+    .eq("user_id", req.user.id)
+    .order("taken_at", { ascending: false })
+    .limit(1)
+    .single();
+
+  const { data: lastSession } = await supabase
+    .from("sessions")
+    .select("program")
+    .eq("user_id", req.user.id)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .single();
+
+  const assessmentType = assessmentTypeForProgram(lastSession?.program || "");
+  const questions = questionsForType(assessmentType);
+
+  if (!lastAssessment) {
+    return res.json({
+      success: true,
+      hasTaken: false,
+      shouldOffer: true,
+      lastTakenAt: null,
+      questions,
+      assessmentType,
+    });
+  }
+
+  res.json({
+    success: true,
+    hasTaken: true,
+    shouldOffer: shouldOfferReassessment(lastAssessment.taken_at),
+    lastTakenAt: lastAssessment.taken_at,
+    questions,
+    assessmentType,
+  });
+});
+
+// PUT /user/goal
+// Update the user's primary_goal_label from the dashboard or settings screen.
+// This is the only non-onboarding place a user can change their goal label.
+app.put("/user/goal", requireAuth, async (req, res) => {
+  if (!req.user.email) {
+    return res.status(403).json({ error: "not_available", message: "Goal tracking is not available for guest sessions." });
+  }
+
+  const label = typeof req.body?.label === "string" ? req.body.label.trim() : "";
+  if (!label) {
+    return res.status(400).json({ error: "invalid_label", message: "label must be a non-empty string." });
+  }
+  if (label.length > 120) {
+    return res.status(400).json({ error: "invalid_label", message: "label must be 120 characters or fewer." });
+  }
+
+  const { error } = await supabase
+    .from("user_profiles")
+    .update({ primary_goal_label: label })
+    .eq("user_id", req.user.id);
+
+  if (error) {
+    console.error("[user/goal] update error:", error.message);
+    return res.status(500).json({ error: "update_failed", message: error.message });
+  }
+  res.json({ success: true, label });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`Mind Tranceform backend running on port ${PORT}`);
