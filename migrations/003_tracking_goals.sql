@@ -7,7 +7,7 @@
 -- One optional row per session. Rating 1–5; skipping leaves no row.
 CREATE TABLE IF NOT EXISTS session_checkins (
   id         uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
-  session_id uuid        NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  session_id text        NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   user_id    uuid        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   rating     int         NOT NULL CHECK (rating BETWEEN 1 AND 5),
   created_at timestamptz NOT NULL DEFAULT now(),
