@@ -18,6 +18,8 @@ const { llmIntentCheck } = require("./safety/intentClassifier");
 const { isEntitledToPro, parseCookies, computeDeviceFingerprint, enforceDeviceCap } = require("./creatorAccess");
 const { goalLabelForProgram, assessmentTypeForProgram, questionsForType } = require("./lib/goalLabels");
 const { computeStreaks, buildHeatmap, shouldOfferReassessment } = require("./lib/streaks");
+const { STEM, ANSWER_SCALE, ATTRIBUTION, itemsForInstrument, scoreAssessment } = require("./lib/clinicalAssessments");
+const { suppressBucket, computeOutcomeStats } = require("./lib/reportingMetrics");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -2823,6 +2825,7 @@ app.get("/progress", requireAuth, async (req, res) => {
       heatmap: buildHeatmap([], tz, 90),
       moodTrend: [],
       selfAssessmentTrend: [],
+      clinicalAssessmentTrend: { phq9: [], gad7: [] },
       goalLabel: null,
     });
   }
@@ -2831,7 +2834,7 @@ app.get("/progress", requireAuth, async (req, res) => {
   const { currentStreak, longestStreak } = computeStreaks(timestamps, tz);
   const heatmap = buildHeatmap(timestamps, tz, 90);
 
-  const [{ data: checkins }, { data: assessments }, { data: profile }] = await Promise.all([
+  const [{ data: checkins }, { data: assessments }, { data: profile }, { data: clinicalAssessments }] = await Promise.all([
     supabase
       .from("session_checkins")
       .select("rating, created_at")
@@ -2847,7 +2850,22 @@ app.get("/progress", requireAuth, async (req, res) => {
       .select("primary_goal_label")
       .eq("user_id", req.user.id)
       .single(),
+    supabase
+      .from("clinical_assessments")
+      .select("instrument, total_score, severity_band, taken_at")
+      .eq("user_id", req.user.id)
+      .order("taken_at", { ascending: true }),
   ]);
+
+  const clinicalAssessmentTrend = { phq9: [], gad7: [] };
+  for (const a of clinicalAssessments || []) {
+    if (!clinicalAssessmentTrend[a.instrument]) continue;
+    clinicalAssessmentTrend[a.instrument].push({
+      date: a.taken_at,
+      totalScore: a.total_score,
+      severityBand: a.severity_band,
+    });
+  }
 
   res.json({
     success: true,
@@ -2861,6 +2879,7 @@ app.get("/progress", requireAuth, async (req, res) => {
       score: a.score,
       type: a.assessment_type,
     })),
+    clinicalAssessmentTrend,
     goalLabel: profile?.primary_goal_label || null,
   });
 });
@@ -2989,6 +3008,235 @@ app.put("/user/goal", requireAuth, async (req, res) => {
     return res.status(500).json({ error: "update_failed", message: error.message });
   }
   res.json({ success: true, label });
+});
+
+// ─── PHQ-9 / GAD-7 CLINICAL ASSESSMENTS ──────────────────────────────────────
+// Validated screening instruments, additive alongside the non-clinical
+// self_assessments track above — do not merge the two. Authenticated users
+// only. Item 9 (PHQ-9 self-harm screening item) triggers a mandatory safety
+// resources card; see safety_response_events below. No automated escalation
+// is ever built on top of that table — see migrations/004_clinical_assessments.sql.
+
+// POST /clinical-assessments
+// body: { instrument: "phq9"|"gad7", responses: { q1: 0-3, ..., qN: 0-3 } }
+app.post("/clinical-assessments", requireAuth, async (req, res) => {
+  if (!req.user.email) {
+    return res.status(403).json({ error: "not_available", message: "Clinical assessments are not available for guest sessions." });
+  }
+
+  const { instrument, responses } = req.body || {};
+  const scored = scoreAssessment(instrument, responses);
+  if (!scored) {
+    return res.status(400).json({ error: "invalid_payload", message: "instrument must be 'phq9' or 'gad7' and responses must contain a valid 0-3 answer for every item." });
+  }
+
+  const { data: inserted, error } = await supabase
+    .from("clinical_assessments")
+    .insert({
+      user_id: req.user.id,
+      instrument,
+      responses,
+      total_score: scored.totalScore,
+      severity_band: scored.severityBand,
+      item9_flag: scored.item9Flag,
+    })
+    .select("id, taken_at")
+    .single();
+
+  if (error) {
+    console.error("[clinical-assessments] insert error:", error.message);
+    return res.status(500).json({ error: "insert_failed", message: error.message });
+  }
+
+  let safetyEventId = null;
+  // Fires regardless of total_score — a low total with a nonzero item 9 still triggers this.
+  if (scored.item9Flag === true) {
+    const { data: safetyEvent, error: safetyErr } = await supabase
+      .from("safety_response_events")
+      .insert({ user_id: req.user.id, assessment_id: inserted.id })
+      .select("id")
+      .single();
+    if (safetyErr) {
+      console.error("[clinical-assessments] safety event insert error:", safetyErr.message);
+    } else {
+      safetyEventId = safetyEvent.id;
+    }
+  }
+
+  res.json({
+    success: true,
+    id: inserted.id,
+    instrument,
+    totalScore: scored.totalScore,
+    severityBand: scored.severityBand,
+    requiresSafetyAck: scored.item9Flag === true,
+    safetyEventId,
+  });
+});
+
+// GET /clinical-assessments/status
+// Per-instrument baseline/re-offer status (mirrors GET /assessments/status),
+// plus static content the client needs to render the assessment screen.
+app.get("/clinical-assessments/status", requireAuth, async (req, res) => {
+  const content = {
+    stem: STEM,
+    answerScale: ANSWER_SCALE,
+    attribution: ATTRIBUTION,
+    phq9Items: itemsForInstrument("phq9"),
+    gad7Items: itemsForInstrument("gad7"),
+  };
+
+  if (!req.user.email) {
+    return res.json({
+      success: true,
+      phq9: { hasTaken: false, shouldOffer: false, lastTakenAt: null },
+      gad7: { hasTaken: false, shouldOffer: false, lastTakenAt: null },
+      ...content,
+    });
+  }
+
+  const { data: lastAssessments } = await supabase
+    .from("clinical_assessments")
+    .select("instrument, taken_at")
+    .eq("user_id", req.user.id)
+    .order("taken_at", { ascending: false });
+
+  const statusFor = (instrument) => {
+    const last = (lastAssessments || []).find((a) => a.instrument === instrument);
+    if (!last) return { hasTaken: false, shouldOffer: true, lastTakenAt: null };
+    return { hasTaken: true, shouldOffer: shouldOfferReassessment(last.taken_at), lastTakenAt: last.taken_at };
+  };
+
+  res.json({
+    success: true,
+    phq9: statusFor("phq9"),
+    gad7: statusFor("gad7"),
+    ...content,
+  });
+});
+
+// GET /clinical-assessments/safety-pending
+// Returns the most recent unacknowledged item-9 safety event, if any, so the
+// client can re-show the resources card on app open until it's acknowledged.
+app.get("/clinical-assessments/safety-pending", requireAuth, async (req, res) => {
+  if (!req.user.email) {
+    return res.json({ success: true, pending: false, event: null });
+  }
+
+  const { data: event } = await supabase
+    .from("safety_response_events")
+    .select("id, assessment_id, shown_at")
+    .eq("user_id", req.user.id)
+    .eq("acknowledged", false)
+    .order("shown_at", { ascending: false })
+    .limit(1)
+    .single();
+
+  res.json({ success: true, pending: !!event, event: event || null });
+});
+
+// POST /clinical-assessments/safety-events/:id/acknowledge
+// Called when the user taps "I understand" on the safety resources card.
+app.post("/clinical-assessments/safety-events/:id/acknowledge", requireAuth, async (req, res) => {
+  if (!req.user.email) {
+    return res.status(403).json({ error: "not_available", message: "Not available for guest sessions." });
+  }
+
+  const { data: updated, error } = await supabase
+    .from("safety_response_events")
+    .update({ acknowledged: true })
+    .eq("id", req.params.id)
+    .eq("user_id", req.user.id)
+    .select("id")
+    .single();
+
+  if (error || !updated) {
+    return res.status(404).json({ error: "not_found", message: "Safety event not found." });
+  }
+  res.json({ success: true });
+});
+
+// GET /admin/reporting/metrics?start=&end=
+// Platform-wide aggregate outcomes/engagement report for EAP RFI responses
+// (see Discussions/code-prompts/eap-reporting-metrics-definitions.md).
+// Distinct from GET /admin/eap-report above — that endpoint predates the
+// clinical instruments and is left untouched.
+// Cohort sizes under 10 are suppressed (null/omitted) to avoid re-identifying
+// an individual's score change — see lib/reportingMetrics.js.
+app.get("/admin/reporting/metrics", requireAdmin, async (req, res) => {
+  const start = req.query.start || new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+  const end   = req.query.end   || new Date().toISOString().slice(0, 10);
+  const startISO = start + "T00:00:00Z";
+  const endISO   = end   + "T23:59:59Z";
+
+  try {
+    // ── Identified / participation / declined ─────────────────────────────────
+    // TODO: scope by employer_id once multi-tenant client model exists — see
+    // Discussions/code-prompts/eap-reporting-metrics-definitions.md, "Schema gap".
+    const { data: identified, error: idErr } = await supabase
+      .from("user_profiles")
+      .select("user_id")
+      .gte("created_at", startISO)
+      .lte("created_at", endISO);
+    if (idErr) throw idErr;
+
+    const identifiedUserIds = (identified || []).map((u) => u.user_id);
+    const totalIdentified = identifiedUserIds.length;
+
+    const { data: windowSessions, error: sessErr } = await supabase
+      .from("sessions")
+      .select("user_id, program")
+      .gte("created_at", startISO)
+      .lte("created_at", endISO);
+    if (sessErr) throw sessErr;
+
+    const participatingUserIds = new Set((windowSessions || []).map((s) => s.user_id).filter(Boolean));
+    const totalParticipation = identifiedUserIds.filter((uid) => participatingUserIds.has(uid)).length;
+    const declinedParticipation = totalIdentified - totalParticipation;
+
+    // ── Engagement by program (presenting-issue proxy) ────────────────────────
+    const programCounts = new Map();
+    for (const s of windowSessions || []) {
+      const key = s.program || "unspecified";
+      programCounts.set(key, (programCounts.get(key) || 0) + 1);
+    }
+    const engagementByProgram = {};
+    for (const [program, count] of programCounts.entries()) {
+      engagementByProgram[program] = suppressBucket(count);
+    }
+
+    // ── Outcomes: PHQ-9 / GAD-7 score change ───────────────────────────────────
+    const outcomes = {};
+    for (const instrument of ["phq9", "gad7"]) {
+      const { data: rows, error: caErr } = await supabase
+        .from("clinical_assessments")
+        .select("user_id, total_score, taken_at")
+        .eq("instrument", instrument)
+        .gte("taken_at", startISO)
+        .lte("taken_at", endISO)
+        .order("taken_at", { ascending: true });
+      if (caErr) throw caErr;
+
+      const byUser = new Map();
+      for (const r of rows || []) {
+        if (!byUser.has(r.user_id)) byUser.set(r.user_id, []);
+        byUser.get(r.user_id).push(r.total_score);
+      }
+      outcomes[instrument] = computeOutcomeStats(instrument, [...byUser.values()]);
+    }
+
+    res.json({
+      period: { start, end },
+      total_identified: totalIdentified,
+      total_participation: totalParticipation,
+      declined_participation: declinedParticipation,
+      engagement_by_program: engagementByProgram,
+      outcomes,
+    });
+  } catch (err) {
+    console.error("[admin/reporting/metrics] error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
