@@ -39,6 +39,15 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const stripeClient = stripe(process.env.STRIPE_SECRET_KEY);
 
+// Annual subscription prices — "limited time" pricing decided 2026-06-19, Stripe
+// Price objects created 2026-07-09 (see Discussions/code-prompts/annual-pricing-
+// stripe-live.md). Prefer env vars (matches STRIPE_PRICE_PREMIUM/PRO convention
+// below) but fall back to the known literal IDs so this works without a Render
+// env var change — Price IDs aren't secrets, they're sent to the client-visible
+// Checkout Session either way.
+const STRIPE_PRICE_PREMIUM_ANNUAL = process.env.STRIPE_PRICE_PREMIUM_ANNUAL || "price_1Trjhu20DZybuAfdynOedTqC";
+const STRIPE_PRICE_PRO_ANNUAL     = process.env.STRIPE_PRICE_PRO_ANNUAL     || "price_1Trji020DZybuAfd9zBo0xk1";
+
 app.use(cors());
 // Raw-body parsing for Stripe must run BEFORE the global JSON parser.
 // body-parser skips re-parsing once req._body is set, so registering
@@ -585,12 +594,19 @@ app.post("/user/subscribe", requireAuth, async (req, res) => {
 
 app.post("/create-checkout", async (req, res) => {
   const { plan, email } = req.body;
+  // billing is only meaningful for subscription plans (premium/pro) — single is a
+  // one-time purchase with no annual option, so it always resolves to the "single" key
+  // below regardless of what (if anything) the client sends for billing.
+  const billing = req.body.billing === "annual" ? "annual" : "monthly";
   const priceMap = {
-    "single":  process.env.STRIPE_PRICE_SINGLE,
-    "premium": process.env.STRIPE_PRICE_PREMIUM,
-    "pro":     process.env.STRIPE_PRICE_PRO,
+    "single":          process.env.STRIPE_PRICE_SINGLE,
+    "premium_monthly": process.env.STRIPE_PRICE_PREMIUM,
+    "premium_annual":  STRIPE_PRICE_PREMIUM_ANNUAL,
+    "pro_monthly":     process.env.STRIPE_PRICE_PRO,
+    "pro_annual":      STRIPE_PRICE_PRO_ANNUAL,
   };
-  const priceId = priceMap[plan];
+  const priceKey = plan === "single" ? "single" : `${plan}_${billing}`;
+  const priceId = priceMap[priceKey];
   if (!priceId) return res.status(400).json({ success: false, error: "Invalid plan." });
   const isSubscription = plan === "premium" || plan === "pro";
   try {
@@ -601,7 +617,7 @@ app.post("/create-checkout", async (req, res) => {
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: `${APP_URL}?payment=success&plan=${plan}&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url:  `${APP_URL}?payment=cancelled`,
-      metadata: { plan, email: email || "" },
+      metadata: { plan, email: email || "", ...(isSubscription ? { billing } : {}) },
     });
     res.json({ success: true, checkoutUrl: session.url, sessionId: session.id });
   } catch (err) {
@@ -1955,10 +1971,17 @@ app.post("/webhook/stripe", async (req, res) => {
       case "customer.subscription.updated": {
         const sub = event.data.object;
         const priceId = sub.items?.data[0]?.price?.id;
+        // Both billing intervals map to the same entitlement tier — annual vs monthly
+        // only changes cadence/amount, not what the subscriber is entitled to. Must
+        // include the annual IDs here or an annual subscriber's plan silently fails to
+        // update on every subscription.updated event (renewal, tier change, etc.) since
+        // this map previously only recognized the three monthly price IDs.
         const priceMap = {
           [process.env.STRIPE_PRICE_SINGLE]:  "single",
           [process.env.STRIPE_PRICE_PREMIUM]: "premium",
           [process.env.STRIPE_PRICE_PRO]:     "pro",
+          [STRIPE_PRICE_PREMIUM_ANNUAL]:      "premium",
+          [STRIPE_PRICE_PRO_ANNUAL]:          "pro",
         };
         const newPlan = priceMap[priceId];
         const periodEnd = sub.current_period_end
