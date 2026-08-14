@@ -193,11 +193,59 @@ async function rejectContentPost(token) {
 // { skipped: true, reason } — never throws just because a platform isn't
 // wired up.
 
+// Conservative default: new videos post as Unlisted, not Public, until Mark
+// has watched a few real ones land correctly. Flip via YOUTUBE_PRIVACY_STATUS
+// (public/unlisted/private) on Render once confident — no code change needed.
+// Decided 2026-08-14: an accidental/premature public post to a real channel
+// (subscriber notifications, indexing) is a lot harder to undo than a late
+// flip to public, so default to the safer side while this is new.
 async function postToYouTube(row) {
-  if (!process.env.YOUTUBE_REFRESH_TOKEN) {
-    return { skipped: true, reason: "YouTube not configured (YOUTUBE_REFRESH_TOKEN not set)" };
+  const { YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN } = process.env;
+  if (!YOUTUBE_CLIENT_ID || !YOUTUBE_CLIENT_SECRET || !YOUTUBE_REFRESH_TOKEN) {
+    return { skipped: true, reason: "YouTube not configured (YOUTUBE_CLIENT_ID/SECRET/REFRESH_TOKEN not set)" };
   }
-  return { success: false, error: "postToYouTube not implemented yet" };
+
+  try {
+    const { google } = require("googleapis");
+    const oauth2Client = new google.auth.OAuth2(YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET);
+    oauth2Client.setCredentials({ refresh_token: YOUTUBE_REFRESH_TOKEN });
+    const youtube = google.youtube({ version: "v3", auth: oauth2Client });
+
+    const { data: fileBlob, error: dlErr } = await getSupabase().storage.from(VIDEO_BUCKET).download(row.video_path);
+    if (dlErr) return { success: false, error: `download from storage failed: ${dlErr.message}` };
+    const videoBuffer = Buffer.from(await fileBlob.arrayBuffer());
+
+    const { Readable } = require("stream");
+    const tags = row.hashtags.split(/\s+/).filter(Boolean).map(h => h.replace(/^#/, ""));
+    const privacyStatus = process.env.YOUTUBE_PRIVACY_STATUS || "unlisted";
+
+    const res = await youtube.videos.insert({
+      part: ["snippet", "status"],
+      requestBody: {
+        snippet: {
+          title: row.caption.length > 100 ? row.caption.slice(0, 97) + "..." : row.caption,
+          description: `${row.cta}\n\n${row.hashtags} #Shorts`,
+          tags,
+          categoryId: "26", // Howto & Style
+        },
+        status: {
+          privacyStatus,
+          selfDeclaredMadeForKids: false,
+        },
+      },
+      media: { body: Readable.from(videoBuffer) },
+    });
+
+    return {
+      success: true,
+      post_id: res.data.id,
+      url: `https://youtube.com/watch?v=${res.data.id}`,
+      privacyStatus,
+    };
+  } catch (err) {
+    const detail = err.response?.data?.error?.message || err.message;
+    return { success: false, error: `YouTube upload failed: ${detail}` };
+  }
 }
 
 async function postToInstagram(row) {

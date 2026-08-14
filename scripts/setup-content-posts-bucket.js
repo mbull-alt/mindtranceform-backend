@@ -27,10 +27,14 @@ async function main() {
     return;
   }
 
+  // NOTE: an explicit fileSizeLimit ("100MB") + allowedMimeTypes here failed
+  // against the live project with "The object exceeded the maximum allowed
+  // size" — confirmed by testing (2026-08-14) that dropping both options
+  // succeeds, matching the existing "session-audio" bucket's convention
+  // (fileSizeLimit: null, no type restriction). trance-ads videos are ~7-10MB
+  // so an unset limit isn't a practical risk here.
   const { error: createErr } = await supabase.storage.createBucket(BUCKET, {
     public: false, // signed URLs only — unreleased marketing videos, not for public/indexed access
-    fileSizeLimit: "100MB",
-    allowedMimeTypes: ["video/mp4"],
   });
 
   if (createErr) {
@@ -38,7 +42,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`✓ Created private bucket "${BUCKET}" (100MB limit, video/mp4 only).`);
+  console.log(`✓ Created private bucket "${BUCKET}".`);
 }
 
 main().catch(err => { console.error(err); process.exit(1); });
