@@ -120,12 +120,26 @@ async function sendApprovalEmail({ id, video_path, script_slot, platform_targets
     <p style="color:#888;font-size:12px;">This link expires in 7 days.</p>
   `;
 
-  const { sendEmail } = require("./email"); // lazy — see getSupabase() comment above
-  await sendEmail({
+  // Deliberately NOT using email.js's sendEmail() here — its default `from`
+  // ("hello@mindtranceform.com") is an unverified Resend domain and 403s.
+  // server.js never actually calls into email.js either; every real email
+  // path there uses getResendClient() + an explicit verified `from`. Matching
+  // that working pattern rather than patching the broken one (see chat,
+  // 2026-08-14 — this surfaced as a real send failure while testing).
+  if (!process.env.RESEND_API_KEY) {
+    console.error(`[content_posts] RESEND_API_KEY not set — cannot send approval email for row ${id}`);
+    return;
+  }
+  const { Resend } = require("resend");
+  const resend = new Resend(process.env.RESEND_API_KEY);
+  const FROM = "Mind Tranceform <noreply@mindtranceformapp.com>";
+  const { error: sendErr } = await resend.emails.send({
+    from: FROM,
     to: adminEmail,
     subject: `Review: ${script_slot} video ready — ${subjectCaption}`,
     html,
   });
+  if (sendErr) console.error(`[content_posts] approval email failed for row ${id}:`, sendErr.message || sendErr);
 }
 
 // ─── approve / reject ───────────────────────────────────────────────────────
