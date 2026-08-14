@@ -13,6 +13,7 @@ const rateLimit = require("express-rate-limit");
 dotenv.config();
 
 const { runDailyContentGeneration, runDailyOutreach, runWeeklyContentGeneration } = require("./contentEngine");
+const { queueContentPost, approveContentPost, rejectContentPost, describeResult, renderResultPage } = require("./contentPosting");
 const { classifyPrompt } = require("./safety/topicClassifier");
 const { llmIntentCheck } = require("./safety/intentClassifier");
 const { isEntitledToPro, parseCookies, computeDeviceFingerprint, enforceDeviceCap } = require("./creatorAccess");
@@ -2571,6 +2572,57 @@ app.post("/cron/weekly-content", (req, res) => {
   if (!verifyCron(req, res)) return;
   console.warn("[cron/weekly-content] DISABLED — blog auto-generation is off");
   res.status(410).json({ success: false, disabled: true, reason: "blog auto-generation disabled" });
+});
+
+// ─── CONTENT POSTS: approval-gated auto-posting (trance-ads/ pipeline) ───────
+// See migrations/005_content_posts.sql and contentPosting.js. /content/queue
+// reuses the same x-cron-secret trust model as the /cron/* endpoints above —
+// it's called by the trance-ads pipeline (a trusted internal caller), not by
+// a browser. The two GET endpoints below have no login: the token in the URL
+// (clicked from the approval email) is the auth, and is effectively
+// single-use since status moves off "pending" on first successful click.
+
+app.post("/content/queue", async (req, res) => {
+  if (!verifyCron(req, res)) return;
+  try {
+    const result = await queueContentPost(req.body || {});
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error("[content/queue]", err.message);
+    res.status(err.statusCode || 500).json({ success: false, error: err.message });
+  }
+});
+
+app.get("/content/approve/:token", async (req, res) => {
+  const outcome = await approveContentPost(req.params.token);
+  if (!outcome.ok) {
+    const title = outcome.reason === "not_found" ? "Link not found"
+                : outcome.reason === "expired"   ? "Link expired"
+                : "Already actioned";
+    const line = outcome.reason === "already_actioned"
+      ? `This video was already marked "${outcome.row.status}" — no change made.`
+      : "This link is no longer valid. No video was posted.";
+    return res.status(outcome.reason === "not_found" ? 404 : 410)
+      .send(renderResultPage({ title, lines: [line], color: "#b91c1c" }));
+  }
+  const lines = Object.entries(outcome.result.results).map(([p, r]) => describeResult(p, r));
+  if (!lines.length) lines.push("Approved. No platforms attempted yet (row left at \"approved\").");
+  res.send(renderResultPage({ title: `Approved — ${outcome.row.script_slot}`, lines, color: "#15803d" }));
+});
+
+app.get("/content/reject/:token", async (req, res) => {
+  const outcome = await rejectContentPost(req.params.token);
+  if (!outcome.ok) {
+    const title = outcome.reason === "not_found" ? "Link not found"
+                : outcome.reason === "expired"   ? "Link expired"
+                : "Already actioned";
+    const line = outcome.reason === "already_actioned"
+      ? `This video was already marked "${outcome.row.status}" — no change made.`
+      : "This link is no longer valid.";
+    return res.status(outcome.reason === "not_found" ? 404 : 410)
+      .send(renderResultPage({ title, lines: [line], color: "#b91c1c" }));
+  }
+  res.send(renderResultPage({ title: `Rejected — ${outcome.row.script_slot}`, lines: ["Nothing was posted."], color: "#374151" }));
 });
 
 // ─── RESEND WEBHOOK (email open/click tracking) ───────────────────────────────

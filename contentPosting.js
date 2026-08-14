@@ -1,0 +1,309 @@
+/**
+ * contentPosting.js — Approval-gated auto-posting pipeline for finished videos
+ * from the trance-ads/ pipeline.
+ *
+ * Flow: trance-ads pipeline uploads a finished MP4 to the "content-videos"
+ * Supabase Storage bucket, then POSTs to /content/queue with the storage path
+ * + metadata. That inserts a `pending` content_posts row and emails Mark an
+ * approve/reject link. Nothing calls a platform's publish endpoint until the
+ * corresponding row is flipped to `approved` via that link.
+ *
+ * Platform posting functions (postToYouTube/Instagram/Facebook/TikTok) are
+ * real implementations once credentials exist for that platform, and return
+ * { skipped: true, reason } when they don't — runPostingJob never fails a
+ * row just because a platform isn't wired up yet, it reports it.
+ *
+ * See migrations/005_content_posts.sql for the table, and the trance-ads
+ * Discussions doc (2026-08-13, "Auto-post pipeline") for the full spec this
+ * implements.
+ */
+
+"use strict";
+
+const crypto = require("crypto");
+const { createClient } = require("@supabase/supabase-js");
+
+// Lazy-init both clients (rather than the eager module-scope pattern used in
+// server.js/contentEngine.js) so this module can be required for its pure
+// functions — decidePostingOutcome, describeResult, renderResultPage,
+// escapeHtml — without SUPABASE_*/RESEND_API_KEY set. See
+// tests/content-posting.test.js, which does exactly that.
+let _supabase = null;
+function getSupabase() {
+  if (!_supabase) {
+    _supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+  }
+  return _supabase;
+}
+
+const BACKEND_URL =
+  process.env.BACKEND_URL ||
+  process.env.RENDER_EXTERNAL_URL ||
+  `http://localhost:${process.env.PORT || 8080}`;
+
+const VIDEO_BUCKET = "content-videos";
+const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days — matches the email copy
+
+// ─── queue ──────────────────────────────────────────────────────────────────
+
+async function queueContentPost({ video_path, script_slot, platform_targets, caption, hashtags, cta }) {
+  if (!video_path || !script_slot || !caption || !hashtags || !cta) {
+    throw Object.assign(new Error("missing required field(s): video_path, script_slot, caption, hashtags, cta"), { statusCode: 400 });
+  }
+  if (!Array.isArray(platform_targets) || platform_targets.length === 0) {
+    throw Object.assign(new Error("platform_targets must be a non-empty array"), { statusCode: 400 });
+  }
+
+  const approval_token = crypto.randomBytes(32).toString("hex");
+  const token_expires_at = new Date(Date.now() + TOKEN_TTL_MS).toISOString();
+
+  const { data, error } = await getSupabase()
+    .from("content_posts")
+    .insert({
+      video_path, script_slot, platform_targets, caption, hashtags, cta,
+      status: "pending", approval_token, token_expires_at,
+    })
+    .select("id")
+    .single();
+
+  if (error) throw Object.assign(new Error(`insert failed: ${error.message}`), { statusCode: 500 });
+
+  await sendApprovalEmail({ id: data.id, video_path, script_slot, platform_targets, caption, approval_token });
+
+  return { id: data.id, status: "pending" };
+}
+
+// ─── approval email ───────────────────────────────────────────────────────
+
+async function getSignedVideoUrl(video_path) {
+  const { data, error } = await getSupabase().storage
+    .from(VIDEO_BUCKET)
+    .createSignedUrl(video_path, TOKEN_TTL_MS / 1000);
+  if (error) {
+    console.error("[content_posts] createSignedUrl:", error.message);
+    return null;
+  }
+  return data.signedUrl;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function sendApprovalEmail({ id, video_path, script_slot, platform_targets, caption, approval_token }) {
+  const adminEmail = process.env.ADMIN_EMAIL;
+  if (!adminEmail) {
+    console.error(`[content_posts] ADMIN_EMAIL not set — cannot send approval email for row ${id}`);
+    return;
+  }
+
+  const videoUrl = await getSignedVideoUrl(video_path);
+  const approveUrl = `${BACKEND_URL}/content/approve/${approval_token}`;
+  const rejectUrl = `${BACKEND_URL}/content/reject/${approval_token}`;
+  const subjectCaption = caption.length > 60 ? caption.slice(0, 57) + "..." : caption;
+
+  const html = `
+    <p>A new video is ready for review.</p>
+    <p>
+      <strong>Slot:</strong> ${escapeHtml(script_slot)}<br>
+      <strong>Caption:</strong> ${escapeHtml(caption)}<br>
+      <strong>Platforms:</strong> ${platform_targets.map(escapeHtml).join(", ")}
+    </p>
+    ${videoUrl
+      ? `<p><a href="${videoUrl}">Watch it</a></p>`
+      : `<p>(Video preview link unavailable — check content_posts row ${id} in Supabase.)</p>`}
+    <p>
+      <a href="${approveUrl}" style="background:#22c55e;color:#fff;padding:10px 16px;text-decoration:none;border-radius:6px;display:inline-block;">Approve and post</a>
+      &nbsp;&nbsp;
+      <a href="${rejectUrl}" style="background:#ef4444;color:#fff;padding:10px 16px;text-decoration:none;border-radius:6px;display:inline-block;">Reject (don't post)</a>
+    </p>
+    <p style="color:#888;font-size:12px;">This link expires in 7 days.</p>
+  `;
+
+  const { sendEmail } = require("./email"); // lazy — see getSupabase() comment above
+  await sendEmail({
+    to: adminEmail,
+    subject: `Review: ${script_slot} video ready — ${subjectCaption}`,
+    html,
+  });
+}
+
+// ─── approve / reject ───────────────────────────────────────────────────────
+// Both look up by token, refuse anything not currently `pending`, and use a
+// conditional UPDATE (.eq("status","pending")) as a race guard so two clicks
+// on the same link (or a retried request) can't both succeed.
+
+async function approveContentPost(token) {
+  const { data: row, error } = await getSupabase()
+    .from("content_posts").select("*").eq("approval_token", token).single();
+  if (error || !row) return { ok: false, reason: "not_found" };
+  if (row.status !== "pending") return { ok: false, reason: "already_actioned", row };
+  if (new Date(row.token_expires_at) < new Date()) return { ok: false, reason: "expired", row };
+
+  const { data: updated, error: updateErr } = await getSupabase()
+    .from("content_posts")
+    .update({ status: "approved", approved_at: new Date().toISOString() })
+    .eq("id", row.id)
+    .eq("status", "pending")
+    .select()
+    .single();
+
+  if (updateErr || !updated) return { ok: false, reason: "already_actioned", row };
+
+  const result = await runPostingJob(updated);
+  return { ok: true, row: updated, result };
+}
+
+async function rejectContentPost(token) {
+  const { data: row, error } = await getSupabase()
+    .from("content_posts").select("*").eq("approval_token", token).single();
+  if (error || !row) return { ok: false, reason: "not_found" };
+  if (row.status !== "pending") return { ok: false, reason: "already_actioned", row };
+  if (new Date(row.token_expires_at) < new Date()) return { ok: false, reason: "expired", row };
+
+  const { data: updated, error: updateErr } = await getSupabase()
+    .from("content_posts")
+    .update({ status: "rejected" })
+    .eq("id", row.id)
+    .eq("status", "pending")
+    .select()
+    .single();
+
+  if (updateErr || !updated) return { ok: false, reason: "already_actioned", row };
+
+  return { ok: true, row: updated };
+}
+
+// ─── platform posting ───────────────────────────────────────────────────────
+// Real implementation once credentials exist for that platform; until then,
+// { skipped: true, reason } — never throws just because a platform isn't
+// wired up.
+
+async function postToYouTube(row) {
+  if (!process.env.YOUTUBE_REFRESH_TOKEN) {
+    return { skipped: true, reason: "YouTube not configured (YOUTUBE_REFRESH_TOKEN not set)" };
+  }
+  return { success: false, error: "postToYouTube not implemented yet" };
+}
+
+async function postToInstagram(row) {
+  if (!process.env.META_PAGE_ACCESS_TOKEN) {
+    return { skipped: true, reason: "Instagram not configured (pending Meta app review)" };
+  }
+  return { success: false, error: "postToInstagram not implemented yet" };
+}
+
+async function postToFacebook(row) {
+  if (!process.env.META_PAGE_ACCESS_TOKEN) {
+    return { skipped: true, reason: "Facebook not configured (pending Meta app review)" };
+  }
+  return { success: false, error: "postToFacebook not implemented yet" };
+}
+
+async function postToTikTok(row) {
+  if (!process.env.TIKTOK_ACCESS_TOKEN) {
+    return { skipped: true, reason: "TikTok not configured (SELF_ONLY integration not yet built)" };
+  }
+  return { success: false, error: "postToTikTok not implemented yet" };
+}
+
+const PLATFORM_POSTERS = {
+  youtube: postToYouTube,
+  instagram: postToInstagram,
+  facebook: postToFacebook,
+  tiktok: postToTikTok,
+};
+
+// Status semantics after a posting attempt. The spec covers two cases
+// explicitly (>=1 success -> "posted"; all attempted and all failed ->
+// "failed"). It doesn't cover "every target platform was skipped because no
+// platform has credentials yet" — which is the real state of every row
+// today, since none of the three integrations are wired up. Decided here
+// (see chat, 2026-08-14) rather than guessed silently: in that case the row
+// is left at "approved", not advanced to "posted" or "failed" — neither
+// claim would be true. It only becomes "posted"/"failed" once a platform is
+// actually attempted.
+async function runPostingJob(row) {
+  const results = {};
+  let anySuccess = false;
+  let anyAttempted = false;
+
+  for (const platform of row.platform_targets) {
+    const poster = PLATFORM_POSTERS[platform];
+    if (!poster) {
+      results[platform] = { success: false, error: `unknown platform "${platform}"` };
+      anyAttempted = true;
+      continue;
+    }
+    try {
+      const r = await poster(row);
+      results[platform] = r;
+      if (r.success) anySuccess = true;
+      if (!r.skipped) anyAttempted = true;
+    } catch (err) {
+      results[platform] = { success: false, error: err.message };
+      anyAttempted = true;
+    }
+  }
+
+  const { status, update } = decidePostingOutcome(results, row.status);
+
+  const { error: updateErr } = await getSupabase().from("content_posts").update(update).eq("id", row.id);
+  if (updateErr) console.error("[content_posts] runPostingJob update failed:", updateErr.message);
+
+  return { status, results };
+}
+
+// Pure decision logic, split out from runPostingJob so it's unit-testable
+// without a live Supabase connection (see tests/content-posting.test.js).
+// priorStatus is always "approved" in production (that's the only status
+// runPostingJob is ever called with) but taking it as a parameter rather than
+// hardcoding keeps the function honest about what it depends on.
+function decidePostingOutcome(results, priorStatus) {
+  const values = Object.values(results);
+  const anySuccess = values.some(r => r.success);
+  const anyAttempted = values.some(r => !r.skipped);
+
+  let status = priorStatus;
+  if (anySuccess) status = "posted";
+  else if (anyAttempted) status = "failed";
+
+  const update = { platform_post_ids: results };
+  if (status !== priorStatus) update.status = status;
+  if (status === "posted") update.posted_at = new Date().toISOString();
+  if (status === "failed") {
+    update.error = Object.entries(results)
+      .filter(([, r]) => !r.success && !r.skipped)
+      .map(([p, r]) => `${p}: ${r.error || "failed"}`)
+      .join("; ");
+  }
+
+  return { status, update };
+}
+
+// ─── result page rendering (for the plain-GET approve/reject links) ─────────
+
+function describeResult(platform, r) {
+  const label = platform.charAt(0).toUpperCase() + platform.slice(1);
+  if (r.success) return `${label} posted ✓`;
+  if (r.skipped) return `${label} skipped — ${escapeHtml(r.reason)}`;
+  return `${label} failed — ${escapeHtml(r.error || "unknown error")}`;
+}
+
+function renderResultPage({ title, lines, color }) {
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>
+<style>body{font-family:system-ui,sans-serif;max-width:480px;margin:80px auto;padding:0 20px;color:#111}
+h1{font-size:20px;color:${color}}ul{padding-left:20px}li{margin:6px 0}</style></head>
+<body><h1>${escapeHtml(title)}</h1><ul>${lines.map(l => `<li>${l}</li>`).join("")}</ul></body></html>`;
+}
+
+module.exports = {
+  queueContentPost,
+  approveContentPost,
+  rejectContentPost,
+  runPostingJob,
+  decidePostingOutcome,
+  describeResult,
+  renderResultPage,
+  escapeHtml,
+};
