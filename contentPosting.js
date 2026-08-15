@@ -314,11 +314,39 @@ async function postToInstagram(row) {
   }
 }
 
+// Same conservative-default reasoning as postToYouTube: publishes as a
+// draft (Page-admin-only) unless FB_PUBLISH_LIVE=true, so the first test
+// doesn't go live on the real Page by default.
 async function postToFacebook(row) {
-  if (!process.env.META_PAGE_ACCESS_TOKEN) {
-    return { skipped: true, reason: "Facebook not configured (pending Meta app review)" };
+  const { FB_PAGE_ID, FB_PAGE_ACCESS_TOKEN } = process.env;
+  if (!FB_PAGE_ID || !FB_PAGE_ACCESS_TOKEN) {
+    return { skipped: true, reason: "Facebook not configured (FB_PAGE_ID/FB_PAGE_ACCESS_TOKEN not set)" };
   }
-  return { success: false, error: "postToFacebook not implemented yet" };
+
+  try {
+    const axios = require("axios");
+    const { data: urlData, error: urlErr } = await getSupabase().storage
+      .from(VIDEO_BUCKET)
+      .createSignedUrl(row.video_path, 3600);
+    if (urlErr) return { success: false, error: `signed url failed: ${urlErr.message}` };
+
+    const description = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}`;
+    const published = process.env.FB_PUBLISH_LIVE === "true";
+
+    const res = await axios.post(`https://graph-video.facebook.com/v21.0/${FB_PAGE_ID}/videos`, null, {
+      params: { file_url: urlData.signedUrl, description, published, access_token: FB_PAGE_ACCESS_TOKEN },
+    });
+
+    return {
+      success: true,
+      post_id: res.data.id,
+      url: `https://www.facebook.com/${FB_PAGE_ID}/videos/${res.data.id}`,
+      published,
+    };
+  } catch (err) {
+    const detail = err.response?.data?.error?.message || err.message;
+    return { success: false, error: `Facebook publish failed: ${detail}` };
+  }
 }
 
 async function postToTikTok(row) {
