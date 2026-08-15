@@ -14,7 +14,7 @@ dotenv.config();
 
 const { runDailyContentGeneration, runDailyOutreach, runWeeklyContentGeneration } = require("./contentEngine");
 const { queueContentPost, approveContentPost, rejectContentPost, describeResult, renderResultPage } = require("./contentPosting");
-const { handleInstagramCallback } = require("./instagramAuth");
+const { handleInstagramCallback, handleDeauthorize, handleDataDeletionInstructions } = require("./instagramAuth");
 const { classifyPrompt } = require("./safety/topicClassifier");
 const { llmIntentCheck } = require("./safety/intentClassifier");
 const { isEntitledToPro, parseCookies, computeDeviceFingerprint, enforceDeviceCap } = require("./creatorAccess");
@@ -2630,6 +2630,8 @@ app.get("/content/reject/:token", async (req, res) => {
 // Meta redirects here after Mark authorizes via Instagram Business Login.
 // See instagramAuth.js.
 app.get("/auth/instagram/callback", handleInstagramCallback);
+app.post("/auth/instagram/deauthorize", express.urlencoded({ extended: false }), handleDeauthorize);
+app.get("/auth/instagram/data-deletion", handleDataDeletionInstructions);
 
 // Meta's webhook verification handshake: GET with hub.mode/hub.challenge/
 // hub.verify_token — must echo back hub.challenge as plain text, and only

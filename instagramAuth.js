@@ -22,6 +22,7 @@
 "use strict";
 
 const axios = require("axios");
+const crypto = require("crypto");
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -116,4 +117,66 @@ async function handleInstagramCallback(req, res) {
   }
 }
 
-module.exports = { handleInstagramCallback };
+// ─── deauthorize callback ────────────────────────────────────────────────────
+// Meta POSTs here (application/x-www-form-urlencoded, field `signed_request`)
+// when the authorized account removes the app's access. Verifies the HMAC
+// signature with the app secret per Meta's spec, then just logs it — this
+// app only holds one shared token (IG_PAGE_ACCESS_TOKEN on Render) for the
+// single Mind Tranceform account, not a per-user token store, so there's
+// nothing else to clean up automatically. If this ever fires unexpectedly,
+// it means that token is dead and Instagram Business Login needs re-running.
+
+function parseSignedRequest(signedRequest, appSecret) {
+  const [encodedSig, encodedPayload] = signedRequest.split(".");
+  if (!encodedSig || !encodedPayload) throw new Error("malformed signed_request");
+  const sig = Buffer.from(encodedSig.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+  const expectedSig = crypto.createHmac("sha256", appSecret).update(encodedPayload).digest();
+  if (sig.length !== expectedSig.length || !crypto.timingSafeEqual(sig, expectedSig)) {
+    throw new Error("signature mismatch");
+  }
+  return JSON.parse(Buffer.from(encodedPayload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString());
+}
+
+function handleDeauthorize(req, res) {
+  const { signed_request } = req.body || {};
+  if (!signed_request) return res.sendStatus(400);
+  const { INSTAGRAM_APP_SECRET } = process.env;
+  if (!INSTAGRAM_APP_SECRET) {
+    console.error("[instagram] deauthorize callback hit but INSTAGRAM_APP_SECRET not set — cannot verify");
+    return res.sendStatus(503);
+  }
+  try {
+    const data = parseSignedRequest(signed_request, INSTAGRAM_APP_SECRET);
+    console.warn(`[instagram] Deauthorize received for user_id ${data.user_id}. IG_PAGE_ACCESS_TOKEN on Render is likely now invalid — Instagram Business Login will need re-running.`);
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("[instagram] deauthorize signature check failed:", err.message);
+    res.sendStatus(400);
+  }
+}
+
+// ─── data deletion instructions ──────────────────────────────────────────────
+// Meta accepts either an automated callback (receive signed_request, respond
+// with {url, confirmation_code} and host a status-check page) or a simple
+// static Instructions URL. Going with the static page: this app is a
+// single-account automation tool, not a multi-user consumer app — there's no
+// per-user data store, so there's nothing for an automated deletion flow to
+// actually act on. The instructions page is the honest, proportionate option.
+
+function handleDataDeletionInstructions(_req, res) {
+  res.send(renderPage({
+    title: "Data Deletion Instructions",
+    color: "#111",
+    bodyHtml: `
+      <p>Mind Tranceform's content-posting integration is configured for a single
+      Instagram Business account and does not collect or store data for any other
+      Instagram users.</p>
+      <p>To request deletion of any data associated with your account's connection
+      to this integration, email
+      <a href="mailto:hello@mindtranceformapp.com">hello@mindtranceformapp.com</a>
+      with your Instagram username. Requests are processed within 30 days.</p>
+    `,
+  }));
+}
+
+module.exports = { handleInstagramCallback, handleDeauthorize, handleDataDeletionInstructions };
