@@ -89,10 +89,32 @@ async function handleFacebookCallback(req, res) {
     const pages = pagesRes.data.data || [];
 
     if (!pages.length) {
+      // Diagnose rather than dead-end: confirm which user this was, and
+      // which permissions were actually granted during authorization —
+      // pages_show_list can silently not be granted even if the rest of
+      // the consent screen was approved.
+      let who = null, perms = null;
+      try {
+        const meRes = await axios.get("https://graph.facebook.com/v21.0/me", { params: { access_token: longLivedUserToken } });
+        who = meRes.data;
+      } catch (_e) {}
+      try {
+        const permRes = await axios.get("https://graph.facebook.com/v21.0/me/permissions", { params: { access_token: longLivedUserToken } });
+        perms = permRes.data.data;
+      } catch (_e) {}
+
       return res.send(renderPage({
         title: "No Pages found",
         color: "#b91c1c",
-        bodyHtml: `<p>This account doesn't manage any Facebook Pages, or the pages_show_list permission wasn't granted during authorization.</p>`,
+        bodyHtml: `
+          <p>This account doesn't manage any Facebook Pages, or the pages_show_list permission wasn't granted during authorization.</p>
+          <table>
+            <tr><td>Authorized as</td><td>${who ? escapeHtml(who.name) + " (" + escapeHtml(who.id) + ")" : "lookup failed"}</td></tr>
+            <tr><td>Granted permissions</td><td>${perms ? escapeHtml(JSON.stringify(perms)) : "lookup failed"}</td></tr>
+          </table>
+          <p style="color:#888;font-size:13px;">Long-lived user token (for debugging, not otherwise needed):</p>
+          <div class="token">${escapeHtml(longLivedUserToken)}</div>
+        `,
       }));
     }
 
