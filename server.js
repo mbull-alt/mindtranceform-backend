@@ -14,6 +14,7 @@ dotenv.config();
 
 const { runDailyContentGeneration, runDailyOutreach, runWeeklyContentGeneration } = require("./contentEngine");
 const { queueContentPost, approveContentPost, rejectContentPost, describeResult, renderResultPage } = require("./contentPosting");
+const { handleInstagramCallback } = require("./instagramAuth");
 const { classifyPrompt } = require("./safety/topicClassifier");
 const { llmIntentCheck } = require("./safety/intentClassifier");
 const { isEntitledToPro, parseCookies, computeDeviceFingerprint, enforceDeviceCap } = require("./creatorAccess");
@@ -2623,6 +2624,31 @@ app.get("/content/reject/:token", async (req, res) => {
       .send(renderResultPage({ title, lines: [line], color: "#b91c1c" }));
   }
   res.send(renderResultPage({ title: `Rejected — ${outcome.row.script_slot}`, lines: ["Nothing was posted."], color: "#374151" }));
+});
+
+// ─── INSTAGRAM OAUTH SETUP (one-time, not part of the posting pipeline) ──────
+// Meta redirects here after Mark authorizes via Instagram Business Login.
+// See instagramAuth.js.
+app.get("/auth/instagram/callback", handleInstagramCallback);
+
+// Meta's webhook verification handshake: GET with hub.mode/hub.challenge/
+// hub.verify_token — must echo back hub.challenge as plain text, and only
+// if the token matches META_WEBHOOK_VERIFY_TOKEN (Render env var, value
+// chosen by Mark, entered into the same field in the Meta app dashboard).
+// Not used for any actual event processing yet — this app only publishes to
+// Instagram/Facebook, it doesn't currently consume webhook events. The POST
+// handler below just acknowledges so Meta's setup wizard doesn't error.
+app.get("/webhook/instagram", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+  if (mode === "subscribe" && token === process.env.META_WEBHOOK_VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
+  res.sendStatus(403);
+});
+app.post("/webhook/instagram", express.json(), (_req, res) => {
+  res.sendStatus(200);
 });
 
 // ─── RESEND WEBHOOK (email open/click tracking) ───────────────────────────────
