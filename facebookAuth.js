@@ -86,7 +86,31 @@ async function handleFacebookCallback(req, res) {
     const pagesRes = await axios.get("https://graph.facebook.com/v21.0/me/accounts", {
       params: { access_token: longLivedUserToken },
     });
-    const pages = pagesRes.data.data || [];
+    let pages = pagesRes.data.data || [];
+
+    // Fallback: Pages owned via a Business Portfolio (Meta Business Suite)
+    // don't show up in /me/accounts unless the user also has a direct
+    // per-Page role assigned — but they DO show up via
+    // /me/businesses -> /{business_id}/owned_pages, given the
+    // business_management scope (requested above). Try that path before
+    // giving up.
+    if (!pages.length) {
+      try {
+        const bizRes = await axios.get("https://graph.facebook.com/v21.0/me/businesses", { params: { access_token: longLivedUserToken } });
+        const businesses = bizRes.data.data || [];
+        const found = [];
+        for (const biz of businesses) {
+          const ownedRes = await axios.get(`https://graph.facebook.com/v21.0/${biz.id}/owned_pages`, { params: { access_token: longLivedUserToken } });
+          for (const p of ownedRes.data.data || []) {
+            try {
+              const tokRes = await axios.get(`https://graph.facebook.com/v21.0/${p.id}`, { params: { fields: "name,access_token", access_token: longLivedUserToken } });
+              found.push({ id: p.id, name: tokRes.data.name, access_token: tokRes.data.access_token, via_business: biz.name });
+            } catch (_e) { /* couldn't get a page-level token for this one — skip it */ }
+          }
+        }
+        pages = found;
+      } catch (_e) { /* business_management likely wasn't granted this time — falls through to diagnostics below */ }
+    }
 
     if (!pages.length) {
       // Diagnose rather than dead-end: confirm which user this was, and
