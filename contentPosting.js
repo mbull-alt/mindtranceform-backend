@@ -248,11 +248,70 @@ async function postToYouTube(row) {
   }
 }
 
+// NOTE on token lifetime: IG_ACCESS_TOKEN as currently issued (via Instagram
+// Business Login) is short-lived (~1hr). The documented ig_exchange_token
+// long-lived-token exchange is failing with "Error validating client secret"
+// against this app/token pair for reasons not yet root-caused (confirmed not
+// a copy-paste error — tried two distinct app secrets and two distinct
+// tokens, same result each time; the token itself works fine for real
+// Graph API calls, just not that specific exchange endpoint). Until that's
+// resolved, this token needs manual re-generation periodically — flagged
+// to Mark, not silently worked around.
 async function postToInstagram(row) {
-  if (!process.env.META_PAGE_ACCESS_TOKEN) {
-    return { skipped: true, reason: "Instagram not configured (pending Meta app review)" };
+  const { IG_ACCESS_TOKEN, IG_BUSINESS_ACCOUNT_ID } = process.env;
+  if (!IG_ACCESS_TOKEN || !IG_BUSINESS_ACCOUNT_ID) {
+    return { skipped: true, reason: "Instagram not configured (IG_ACCESS_TOKEN/IG_BUSINESS_ACCOUNT_ID not set)" };
   }
-  return { success: false, error: "postToInstagram not implemented yet" };
+
+  try {
+    const axios = require("axios");
+    const { data: urlData, error: urlErr } = await getSupabase().storage
+      .from(VIDEO_BUCKET)
+      .createSignedUrl(row.video_path, 3600);
+    if (urlErr) return { success: false, error: `signed url failed: ${urlErr.message}` };
+
+    const caption = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}`;
+
+    const createRes = await axios.post(`https://graph.instagram.com/v21.0/${IG_BUSINESS_ACCOUNT_ID}/media`, null, {
+      params: { media_type: "REELS", video_url: urlData.signedUrl, caption, access_token: IG_ACCESS_TOKEN },
+    });
+    const creationId = createRes.data.id;
+
+    // Instagram processes the video asynchronously — poll until FINISHED
+    // before publishing. ~2.5 min ceiling at 5s intervals.
+    let status = "IN_PROGRESS";
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      const statusRes = await axios.get(`https://graph.instagram.com/v21.0/${creationId}`, {
+        params: { fields: "status_code", access_token: IG_ACCESS_TOKEN },
+      });
+      status = statusRes.data.status_code;
+      if (status === "FINISHED" || status === "ERROR") break;
+    }
+    if (status !== "FINISHED") {
+      return { success: false, error: `container never finished processing (status: ${status})` };
+    }
+
+    const publishRes = await axios.post(`https://graph.instagram.com/v21.0/${IG_BUSINESS_ACCOUNT_ID}/media_publish`, null, {
+      params: { creation_id: creationId, access_token: IG_ACCESS_TOKEN },
+    });
+    const mediaId = publishRes.data.id;
+
+    // The numeric media ID isn't the public URL shortcode — fetch the real
+    // permalink rather than guessing at a URL shape.
+    let url = null;
+    try {
+      const permalinkRes = await axios.get(`https://graph.instagram.com/v21.0/${mediaId}`, {
+        params: { fields: "permalink", access_token: IG_ACCESS_TOKEN },
+      });
+      url = permalinkRes.data.permalink;
+    } catch (_e) { /* non-fatal — the post still succeeded */ }
+
+    return { success: true, post_id: mediaId, url };
+  } catch (err) {
+    const detail = err.response?.data?.error?.message || err.message;
+    return { success: false, error: `Instagram publish failed: ${detail}` };
+  }
 }
 
 async function postToFacebook(row) {
