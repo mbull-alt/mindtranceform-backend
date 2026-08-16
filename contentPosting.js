@@ -44,14 +44,53 @@ const BACKEND_URL =
 const VIDEO_BUCKET = "content-videos";
 const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days — matches the email copy
 
+// The first real post (2026-08-13/14) shipped with no link anywhere —
+// root cause: content_posts never had a dedicated link field, and the
+// caption/hashtags/cta fields used for that post simply didn't contain
+// one (confirmed directly, not inferred — see chat, 2026-08-16). Fixed two
+// ways: (1) queueContentPost rejects anything missing both URLs below, so
+// the source content is required to carry them; (2) every postTo* function
+// also explicitly appends this exact line to what it actually posts,
+// so the fix doesn't depend on every future caller remembering correctly.
+const REQUIRED_LINK_WEB = "mindtranceformapp.com";
+const REQUIRED_LINK_PLAY = "play.google.com/store/apps/details?id=com.mindtranceformapp.app.twa";
+const CANONICAL_LINK_LINE = "app.mindtranceformapp.com — also on Google Play: play.google.com/store/apps/details?id=com.mindtranceformapp.app.twa";
+
+// Platforms whose native API supports scheduled publishing directly —
+// these always post immediately on approval (the API call itself just
+// carries a future publish time); everything else must not be attempted
+// until scheduled_for actually arrives, handled by runPostingJob below.
+const NATIVE_SCHEDULE_SUPPORTED = { youtube: true };
+
+function hasRequiredLinks(caption, hashtags, cta) {
+  const combined = `${caption} ${hashtags} ${cta}`;
+  return combined.includes(REQUIRED_LINK_WEB) && combined.includes(REQUIRED_LINK_PLAY);
+}
+
 // ─── queue ──────────────────────────────────────────────────────────────────
 
-async function queueContentPost({ video_path, script_slot, platform_targets, caption, hashtags, cta }) {
+async function queueContentPost({ video_path, script_slot, platform_targets, caption, hashtags, cta, scheduled_for }) {
   if (!video_path || !script_slot || !caption || !hashtags || !cta) {
     throw Object.assign(new Error("missing required field(s): video_path, script_slot, caption, hashtags, cta"), { statusCode: 400 });
   }
   if (!Array.isArray(platform_targets) || platform_targets.length === 0) {
     throw Object.assign(new Error("platform_targets must be a non-empty array"), { statusCode: 400 });
+  }
+
+  if (!hasRequiredLinks(caption, hashtags, cta)) {
+    throw Object.assign(new Error(
+      "caption/hashtags/cta must include both the web URL (mindtranceformapp.com) and the direct Google Play URL " +
+      "(play.google.com/store/apps/details?id=com.mindtranceformapp.app.twa)"
+    ), { statusCode: 400 });
+  }
+
+  let scheduledForIso = null;
+  if (scheduled_for) {
+    const parsed = new Date(scheduled_for);
+    if (isNaN(parsed.getTime())) {
+      throw Object.assign(new Error("scheduled_for must be a valid ISO 8601 timestamp"), { statusCode: 400 });
+    }
+    scheduledForIso = parsed.toISOString();
   }
 
   const approval_token = crypto.randomBytes(32).toString("hex");
@@ -61,6 +100,7 @@ async function queueContentPost({ video_path, script_slot, platform_targets, cap
     .from("content_posts")
     .insert({
       video_path, script_slot, platform_targets, caption, hashtags, cta,
+      scheduled_for: scheduledForIso,
       status: "pending", approval_token, token_expires_at,
     })
     .select("id")
@@ -68,7 +108,7 @@ async function queueContentPost({ video_path, script_slot, platform_targets, cap
 
   if (error) throw Object.assign(new Error(`insert failed: ${error.message}`), { statusCode: 500 });
 
-  await sendApprovalEmail({ id: data.id, video_path, script_slot, platform_targets, caption, approval_token });
+  await sendApprovalEmail({ id: data.id, video_path, script_slot, platform_targets, caption, approval_token, scheduled_for: scheduledForIso });
 
   return { id: data.id, status: "pending" };
 }
@@ -90,7 +130,7 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-async function sendApprovalEmail({ id, video_path, script_slot, platform_targets, caption, approval_token }) {
+async function sendApprovalEmail({ id, video_path, script_slot, platform_targets, caption, approval_token, scheduled_for }) {
   const adminEmail = process.env.ADMIN_EMAIL;
   if (!adminEmail) {
     console.error(`[content_posts] ADMIN_EMAIL not set — cannot send approval email for row ${id}`);
@@ -101,19 +141,23 @@ async function sendApprovalEmail({ id, video_path, script_slot, platform_targets
   const approveUrl = `${BACKEND_URL}/content/approve/${approval_token}`;
   const rejectUrl = `${BACKEND_URL}/content/reject/${approval_token}`;
   const subjectCaption = caption.length > 60 ? caption.slice(0, 57) + "..." : caption;
+  const scheduledLine = scheduled_for
+    ? `<strong>Scheduled for:</strong> ${escapeHtml(new Date(scheduled_for).toLocaleString("en-US", { timeZone: "America/New_York", dateStyle: "medium", timeStyle: "short" }))} ET<br>`
+    : "";
 
   const html = `
     <p>A new video is ready for review.</p>
     <p>
       <strong>Slot:</strong> ${escapeHtml(script_slot)}<br>
       <strong>Caption:</strong> ${escapeHtml(caption)}<br>
-      <strong>Platforms:</strong> ${platform_targets.map(escapeHtml).join(", ")}
+      <strong>Platforms:</strong> ${platform_targets.map(escapeHtml).join(", ")}<br>
+      ${scheduledLine}
     </p>
     ${videoUrl
       ? `<p><a href="${videoUrl}">Watch it</a></p>`
       : `<p>(Video preview link unavailable — check content_posts row ${id} in Supabase.)</p>`}
     <p>
-      <a href="${approveUrl}" style="background:#22c55e;color:#fff;padding:10px 16px;text-decoration:none;border-radius:6px;display:inline-block;">Approve and post</a>
+      <a href="${approveUrl}" style="background:#22c55e;color:#fff;padding:10px 16px;text-decoration:none;border-radius:6px;display:inline-block;">${scheduled_for ? "Approve (posts at scheduled time)" : "Approve and post now"}</a>
       &nbsp;&nbsp;
       <a href="${rejectUrl}" style="background:#ef4444;color:#fff;padding:10px 16px;text-decoration:none;border-radius:6px;display:inline-block;">Reject (don't post)</a>
     </p>
@@ -217,21 +261,26 @@ async function postToYouTube(row) {
 
     const { Readable } = require("stream");
     const tags = row.hashtags.split(/\s+/).filter(Boolean).map(h => h.replace(/^#/, ""));
-    const privacyStatus = process.env.YOUTUBE_PRIVACY_STATUS || "unlisted";
+
+    // Native scheduled publish: upload now as private with publishAt set,
+    // YouTube itself flips it public at that timestamp — no cron needed on
+    // our end for this platform specifically (see NATIVE_SCHEDULE_SUPPORTED).
+    const scheduledMs = row.scheduled_for ? new Date(row.scheduled_for).getTime() : null;
+    const isFutureSchedule = scheduledMs && scheduledMs > Date.now();
+    const status = isFutureSchedule
+      ? { privacyStatus: "private", publishAt: new Date(scheduledMs).toISOString(), selfDeclaredMadeForKids: false }
+      : { privacyStatus: process.env.YOUTUBE_PRIVACY_STATUS || "unlisted", selfDeclaredMadeForKids: false };
 
     const res = await youtube.videos.insert({
       part: ["snippet", "status"],
       requestBody: {
         snippet: {
           title: row.caption.length > 100 ? row.caption.slice(0, 97) + "..." : row.caption,
-          description: `${row.cta}\n\n${row.hashtags} #Shorts`,
+          description: `${row.cta}\n\n${row.hashtags} #Shorts\n\n${CANONICAL_LINK_LINE}`,
           tags,
           categoryId: "26", // Howto & Style
         },
-        status: {
-          privacyStatus,
-          selfDeclaredMadeForKids: false,
-        },
+        status,
       },
       media: { body: Readable.from(videoBuffer) },
     });
@@ -240,7 +289,8 @@ async function postToYouTube(row) {
       success: true,
       post_id: res.data.id,
       url: `https://youtube.com/watch?v=${res.data.id}`,
-      privacyStatus,
+      privacyStatus: status.privacyStatus,
+      publishAt: status.publishAt || null,
     };
   } catch (err) {
     const detail = err.response?.data?.error?.message || err.message;
@@ -276,7 +326,7 @@ async function postToInstagram(row) {
       .createSignedUrl(row.video_path, 3600);
     if (urlErr) return { success: false, error: `signed url failed: ${urlErr.message}` };
 
-    const caption = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}`;
+    const caption = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}\n\n${CANONICAL_LINK_LINE}`;
 
     const createRes = await axios.post(`https://graph.instagram.com/v21.0/${IG_BUSINESS_ACCOUNT_ID}/media`, null, {
       params: { media_type: "REELS", video_url: urlData.signedUrl, caption, access_token: IG_ACCESS_TOKEN },
@@ -336,7 +386,7 @@ async function postToFacebook(row) {
       .createSignedUrl(row.video_path, 3600);
     if (urlErr) return { success: false, error: `signed url failed: ${urlErr.message}` };
 
-    const description = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}`;
+    const description = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}\n\n${CANONICAL_LINK_LINE}`;
     const published = process.env.FB_PUBLISH_LIVE === "true";
 
     const res = await axios.post(`https://graph-video.facebook.com/v21.0/${FB_PAGE_ID}/videos`, null, {
@@ -372,7 +422,7 @@ async function postToTikTok(row) {
     if (dlErr) return { success: false, error: `download from storage failed: ${dlErr.message}` };
     const videoBuffer = Buffer.from(await fileBlob.arrayBuffer());
 
-    const title = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}`.slice(0, 2200);
+    const title = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}\n\n${CANONICAL_LINK_LINE}`.slice(0, 2200);
 
     const initRes = await axios.post(
       "https://open.tiktokapis.com/v2/post/publish/video/init/",
@@ -435,26 +485,48 @@ const PLATFORM_POSTERS = {
 // is left at "approved", not advanced to "posted" or "failed" — neither
 // claim would be true. It only becomes "posted"/"failed" once a platform is
 // actually attempted.
+// Pure decision for a single platform within runPostingJob, split out so
+// the scheduling logic is unit-testable without a live poster call. nowMs
+// is a parameter rather than reading Date.now() internally so tests can
+// pin it exactly (see tests/content-posting.test.js).
+function decidePlatformAction(platform, existingResult, scheduledFor, nowMs) {
+  if (existingResult?.success) return { action: "skip" };
+
+  if (!PLATFORM_POSTERS[platform]) {
+    return { action: "unknown", result: { success: false, error: `unknown platform "${platform}"` } };
+  }
+
+  const scheduledMs = scheduledFor ? new Date(scheduledFor).getTime() : null;
+  const isFutureSchedule = scheduledMs && scheduledMs > nowMs;
+  if (isFutureSchedule && !NATIVE_SCHEDULE_SUPPORTED[platform]) {
+    return { action: "defer", result: { skipped: true, reason: `scheduled for ${new Date(scheduledMs).toISOString()}, not yet due` } };
+  }
+
+  return { action: "attempt" };
+}
+
+// Called both at approval time and (for rows with a future scheduled_for)
+// again later by the scheduled-posts sweep. Safe to call more than once on
+// the same row: results starts from whatever's already stored, already-
+// successful platforms are never re-attempted, and whether a platform gets
+// attempted THIS call vs deferred is derived from actual elapsed time
+// (scheduled_for vs Date.now()) rather than a flag saying which caller this
+// is — so the sweep doesn't need to tell this function anything special,
+// it just needs to call it again once scheduled_for has actually passed.
 async function runPostingJob(row) {
-  const results = {};
-  let anySuccess = false;
-  let anyAttempted = false;
+  const results = { ...(row.platform_post_ids || {}) };
 
   for (const platform of row.platform_targets) {
+    const decision = decidePlatformAction(platform, results[platform], row.scheduled_for, Date.now());
+    if (decision.action === "skip") continue; // already posted — never double-post
+    if (decision.action === "defer") { results[platform] = decision.result; continue; }
+    if (decision.action === "unknown") { results[platform] = decision.result; continue; }
+
     const poster = PLATFORM_POSTERS[platform];
-    if (!poster) {
-      results[platform] = { success: false, error: `unknown platform "${platform}"` };
-      anyAttempted = true;
-      continue;
-    }
     try {
-      const r = await poster(row);
-      results[platform] = r;
-      if (r.success) anySuccess = true;
-      if (!r.skipped) anyAttempted = true;
+      results[platform] = await poster(row);
     } catch (err) {
       results[platform] = { success: false, error: err.message };
-      anyAttempted = true;
     }
   }
 
@@ -464,6 +536,34 @@ async function runPostingJob(row) {
   if (updateErr) console.error("[content_posts] runPostingJob update failed:", updateErr.message);
 
   return { status, results };
+}
+
+// Finds content_posts rows whose scheduled time has arrived and still have
+// work left to do, and re-runs the posting job for each. Rows self-exclude
+// once fully resolved: decidePostingOutcome flips status away from
+// "approved" (to "posted" or "failed") once nothing's left pending, so this
+// query naturally stops returning them — no extra bookkeeping needed.
+async function runScheduledPostsSweep() {
+  const { data: dueRows, error } = await getSupabase()
+    .from("content_posts")
+    .select("*")
+    .eq("status", "approved")
+    .not("scheduled_for", "is", null)
+    .lte("scheduled_for", new Date().toISOString());
+
+  if (error) throw new Error(`scheduled sweep query failed: ${error.message}`);
+
+  const outcomes = [];
+  for (const row of dueRows || []) {
+    try {
+      const result = await runPostingJob(row);
+      outcomes.push({ id: row.id, ...result });
+    } catch (err) {
+      console.error(`[content_posts] sweep failed for row ${row.id}:`, err.message);
+      outcomes.push({ id: row.id, status: "error", error: err.message });
+    }
+  }
+  return outcomes;
 }
 
 // Pure decision logic, split out from runPostingJob so it's unit-testable
@@ -514,8 +614,12 @@ module.exports = {
   approveContentPost,
   rejectContentPost,
   runPostingJob,
+  runScheduledPostsSweep,
   decidePostingOutcome,
+  decidePlatformAction,
   describeResult,
   renderResultPage,
   escapeHtml,
+  hasRequiredLinks,
+  CANONICAL_LINK_LINE,
 };

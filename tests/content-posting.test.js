@@ -9,9 +9,12 @@
 const assert = require("assert");
 const {
   decidePostingOutcome,
+  decidePlatformAction,
   describeResult,
   renderResultPage,
   escapeHtml,
+  hasRequiredLinks,
+  CANONICAL_LINK_LINE,
 } = require("../contentPosting");
 
 let passed = 0;
@@ -129,6 +132,85 @@ test("escapes the title too", () => {
   const page = renderResultPage({ title: `<b>hi</b>`, lines: ["ok"], color: "#000" });
   assert.ok(!page.includes("<b>hi</b>"));
   assert.ok(page.includes("&lt;b&gt;hi&lt;/b&gt;"));
+});
+
+console.log("\nhasRequiredLinks");
+
+test("true when both links present via the canonical line", () => {
+  assert.strictEqual(hasRequiredLinks("caption", "#tags", CANONICAL_LINK_LINE), true);
+});
+
+test("true when links are split across different fields", () => {
+  assert.strictEqual(
+    hasRequiredLinks("check out mindtranceformapp.com", "#tags", "play.google.com/store/apps/details?id=com.mindtranceformapp.app.twa"),
+    true
+  );
+});
+
+test("false when both links are missing — this is the exact real bug (2026-08-13/14 first live post)", () => {
+  assert.strictEqual(
+    hasRequiredLinks(
+      "Calm added AI. It still can't write you anything new.",
+      "#cantfocus #selfhypnosis #mentalfatigue #hypnosisapp",
+      "Try your first session free. If you stay, Premium's $19.99 a month."
+    ),
+    false
+  );
+});
+
+test("false when only the web link is present", () => {
+  assert.strictEqual(hasRequiredLinks("mindtranceformapp.com", "#tags", "cta"), false);
+});
+
+test("false when only the Play link is present", () => {
+  assert.strictEqual(hasRequiredLinks("play.google.com/store/apps/details?id=com.mindtranceformapp.app.twa", "#tags", "cta"), false);
+});
+
+console.log("\ndecidePlatformAction");
+
+const NOW = new Date("2026-08-16T12:00:00Z").getTime();
+const FUTURE = "2026-08-16T18:00:00Z"; // 6h ahead of NOW
+const PAST = "2026-08-16T06:00:00Z";   // 6h behind NOW
+
+test("no scheduled_for -> attempt immediately, any platform", () => {
+  assert.deepStrictEqual(decidePlatformAction("tiktok", undefined, null, NOW), { action: "attempt" });
+});
+
+test("scheduled_for in the past -> attempt immediately (due)", () => {
+  assert.deepStrictEqual(decidePlatformAction("instagram", undefined, PAST, NOW), { action: "attempt" });
+});
+
+test("scheduled_for in the future, non-native platform -> defer", () => {
+  const result = decidePlatformAction("tiktok", undefined, FUTURE, NOW);
+  assert.strictEqual(result.action, "defer");
+  assert.strictEqual(result.result.skipped, true);
+  assert.ok(result.result.reason.includes(new Date(FUTURE).toISOString()));
+});
+
+test("scheduled_for in the future, YouTube (native scheduling) -> attempt immediately regardless", () => {
+  assert.deepStrictEqual(decidePlatformAction("youtube", undefined, FUTURE, NOW), { action: "attempt" });
+});
+
+test("already succeeded -> skip, never re-attempt", () => {
+  assert.deepStrictEqual(
+    decidePlatformAction("youtube", { success: true, post_id: "abc" }, FUTURE, NOW),
+    { action: "skip" }
+  );
+});
+
+test("previously deferred (not yet success) -> re-evaluated, not treated as done", () => {
+  const priorDeferred = { skipped: true, reason: "scheduled for later" };
+  // Still future -> defer again
+  assert.strictEqual(decidePlatformAction("tiktok", priorDeferred, FUTURE, NOW).action, "defer");
+  // Now past -> attempt for real (this is what the sweep re-run relies on)
+  assert.strictEqual(decidePlatformAction("tiktok", priorDeferred, PAST, NOW).action, "attempt");
+});
+
+test("unknown platform -> unknown action with an error result, not a crash", () => {
+  const result = decidePlatformAction("myspace", undefined, null, NOW);
+  assert.strictEqual(result.action, "unknown");
+  assert.strictEqual(result.result.success, false);
+  assert.ok(result.result.error.includes("myspace"));
 });
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

@@ -13,7 +13,7 @@ const rateLimit = require("express-rate-limit");
 dotenv.config();
 
 const { runDailyContentGeneration, runDailyOutreach, runWeeklyContentGeneration } = require("./contentEngine");
-const { queueContentPost, approveContentPost, rejectContentPost, describeResult, renderResultPage } = require("./contentPosting");
+const { queueContentPost, approveContentPost, rejectContentPost, runScheduledPostsSweep, describeResult, renderResultPage } = require("./contentPosting");
 const { handleInstagramCallback, handleDeauthorize, handleDataDeletionInstructions } = require("./instagramAuth");
 const { handleFacebookCallback } = require("./facebookAuth");
 const { handleTikTokCallback } = require("./tiktokAuth");
@@ -2593,6 +2593,23 @@ app.post("/content/queue", async (req, res) => {
   } catch (err) {
     console.error("[content/queue]", err.message);
     res.status(err.statusCode || 500).json({ success: false, error: err.message });
+  }
+});
+
+// Picks up rows approved with a future scheduled_for once that time has
+// actually arrived (non-native-schedule platforms only — YouTube posts
+// immediately at approval time via its own native publishAt, see
+// contentPosting.js). Same trust model as /content/queue and the other
+// /cron/* endpoints — reuses verifyCron/CRON_SECRET rather than inventing a
+// separate auth mechanism for this one.
+app.post("/cron/run-scheduled-posts", async (req, res) => {
+  if (!verifyCron(req, res)) return;
+  try {
+    const outcomes = await runScheduledPostsSweep();
+    res.json({ success: true, checked: outcomes.length, outcomes });
+  } catch (err) {
+    console.error("[cron/run-scheduled-posts]", err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
