@@ -349,11 +349,67 @@ async function postToFacebook(row) {
   }
 }
 
+// Per the build spec's stop condition: no workaround for the SELF_ONLY
+// restriction on unaudited apps. privacy_level is hardcoded here, not
+// configurable via env var like YouTube/Facebook's publish-status flags —
+// this one genuinely can't go public until/unless TikTok audits the app.
 async function postToTikTok(row) {
-  if (!process.env.TIKTOK_ACCESS_TOKEN) {
-    return { skipped: true, reason: "TikTok not configured (SELF_ONLY integration not yet built)" };
+  const { TIKTOK_ACCESS_TOKEN } = process.env;
+  if (!TIKTOK_ACCESS_TOKEN) {
+    return { skipped: true, reason: "TikTok not configured (TIKTOK_ACCESS_TOKEN not set)" };
   }
-  return { success: false, error: "postToTikTok not implemented yet" };
+
+  try {
+    const axios = require("axios");
+    const { data: fileBlob, error: dlErr } = await getSupabase().storage.from(VIDEO_BUCKET).download(row.video_path);
+    if (dlErr) return { success: false, error: `download from storage failed: ${dlErr.message}` };
+    const videoBuffer = Buffer.from(await fileBlob.arrayBuffer());
+
+    const title = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}`.slice(0, 2200);
+
+    const initRes = await axios.post(
+      "https://open.tiktokapis.com/v2/post/publish/video/init/",
+      {
+        post_info: { title, privacy_level: "SELF_ONLY", disable_duet: false, disable_comment: false, disable_stitch: false },
+        source_info: { source: "FILE_UPLOAD", video_size: videoBuffer.length, chunk_size: videoBuffer.length, total_chunk_count: 1 },
+      },
+      { headers: { Authorization: `Bearer ${TIKTOK_ACCESS_TOKEN}`, "Content-Type": "application/json" } }
+    );
+    if (initRes.data.error?.code !== "ok") {
+      return { success: false, error: `init failed: ${initRes.data.error?.message || "unknown"}` };
+    }
+    const { publish_id, upload_url } = initRes.data.data;
+
+    await axios.put(upload_url, videoBuffer, {
+      headers: {
+        "Content-Type": "video/mp4",
+        "Content-Length": videoBuffer.length,
+        "Content-Range": `bytes 0-${videoBuffer.length - 1}/${videoBuffer.length}`,
+      },
+      maxBodyLength: Infinity,
+    });
+
+    // Poll for completion — TikTok processes the upload asynchronously.
+    let status = "PROCESSING_UPLOAD";
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      const statusRes = await axios.post(
+        "https://open.tiktokapis.com/v2/post/publish/status/fetch/",
+        { publish_id },
+        { headers: { Authorization: `Bearer ${TIKTOK_ACCESS_TOKEN}`, "Content-Type": "application/json" } }
+      );
+      status = statusRes.data.data?.status;
+      if (status === "PUBLISH_COMPLETE" || status === "FAILED") break;
+    }
+    if (status !== "PUBLISH_COMPLETE") {
+      return { success: false, error: `publish never completed (status: ${status})` };
+    }
+
+    return { success: true, post_id: publish_id, privacyLevel: "SELF_ONLY" };
+  } catch (err) {
+    const detail = err.response?.data?.error?.message || err.message;
+    return { success: false, error: `TikTok publish failed: ${detail}` };
+  }
 }
 
 const PLATFORM_POSTERS = {

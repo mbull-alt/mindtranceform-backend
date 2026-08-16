@@ -16,6 +16,7 @@ const { runDailyContentGeneration, runDailyOutreach, runWeeklyContentGeneration 
 const { queueContentPost, approveContentPost, rejectContentPost, describeResult, renderResultPage } = require("./contentPosting");
 const { handleInstagramCallback, handleDeauthorize, handleDataDeletionInstructions } = require("./instagramAuth");
 const { handleFacebookCallback } = require("./facebookAuth");
+const { handleTikTokCallback } = require("./tiktokAuth");
 const { classifyPrompt } = require("./safety/topicClassifier");
 const { llmIntentCheck } = require("./safety/intentClassifier");
 const { isEntitledToPro, parseCookies, computeDeviceFingerprint, enforceDeviceCap } = require("./creatorAccess");
@@ -2634,6 +2635,7 @@ app.get("/auth/instagram/callback", handleInstagramCallback);
 app.post("/auth/instagram/deauthorize", express.urlencoded({ extended: false }), handleDeauthorize);
 app.get("/auth/instagram/data-deletion", handleDataDeletionInstructions);
 app.get("/auth/facebook/callback", handleFacebookCallback);
+app.get("/auth/tiktok/callback", handleTikTokCallback);
 
 // Meta's webhook verification handshake: GET with hub.mode/hub.challenge/
 // hub.verify_token — must echo back hub.challenge as plain text, and only
