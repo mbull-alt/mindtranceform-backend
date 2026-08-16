@@ -67,6 +67,29 @@ test("all skipped (no platform configured) -> status stays at prior value, not p
   assert.strictEqual(update.error, undefined);
 });
 
+test("REGRESSION: YouTube succeeds immediately (native scheduling) while TikTok is still deferred -> status stays approved, NOT posted", () => {
+  // This is the exact bug caught while designing the scheduling sweep: if
+  // this finalized to "posted" the moment YouTube succeeded, the sweep's
+  // `WHERE status = 'approved'` query would never find this row again, and
+  // the deferred TikTok post would never actually go out.
+  const { status, update } = decidePostingOutcome(
+    { youtube: { success: true, post_id: "abc", publishAt: "2026-08-17T00:00:00.000Z" }, tiktok: { deferred: true, reason: "scheduled for 2026-08-17T00:00:00.000Z, not yet due" } },
+    "approved"
+  );
+  assert.strictEqual(status, "approved");
+  assert.strictEqual(update.status, undefined);
+  assert.strictEqual(update.posted_at, undefined);
+});
+
+test("REGRESSION follow-up: once the deferred platform is later attempted for real, status finalizes normally", () => {
+  const { status, update } = decidePostingOutcome(
+    { youtube: { success: true, post_id: "abc" }, tiktok: { success: true, post_id: "xyz" } },
+    "approved"
+  );
+  assert.strictEqual(status, "posted");
+  assert.ok(update.posted_at);
+});
+
 test("mix of skipped and success -> posted (skips don't count as failures)", () => {
   const { status, update } = decidePostingOutcome(
     { youtube: { success: true, post_id: "abc" }, tiktok: { skipped: true, reason: "not configured" } },
@@ -180,10 +203,11 @@ test("scheduled_for in the past -> attempt immediately (due)", () => {
   assert.deepStrictEqual(decidePlatformAction("instagram", undefined, PAST, NOW), { action: "attempt" });
 });
 
-test("scheduled_for in the future, non-native platform -> defer", () => {
+test("scheduled_for in the future, non-native platform -> defer (deferred, NOT skipped)", () => {
   const result = decidePlatformAction("tiktok", undefined, FUTURE, NOW);
   assert.strictEqual(result.action, "defer");
-  assert.strictEqual(result.result.skipped, true);
+  assert.strictEqual(result.result.deferred, true);
+  assert.strictEqual(result.result.skipped, undefined, "must not be marked skipped — decidePostingOutcome treats those differently");
   assert.ok(result.result.reason.includes(new Date(FUTURE).toISOString()));
 });
 
@@ -199,7 +223,7 @@ test("already succeeded -> skip, never re-attempt", () => {
 });
 
 test("previously deferred (not yet success) -> re-evaluated, not treated as done", () => {
-  const priorDeferred = { skipped: true, reason: "scheduled for later" };
+  const priorDeferred = { deferred: true, reason: "scheduled for later" };
   // Still future -> defer again
   assert.strictEqual(decidePlatformAction("tiktok", priorDeferred, FUTURE, NOW).action, "defer");
   // Now past -> attempt for real (this is what the sweep re-run relies on)

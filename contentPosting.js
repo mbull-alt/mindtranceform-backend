@@ -499,7 +499,16 @@ function decidePlatformAction(platform, existingResult, scheduledFor, nowMs) {
   const scheduledMs = scheduledFor ? new Date(scheduledFor).getTime() : null;
   const isFutureSchedule = scheduledMs && scheduledMs > nowMs;
   if (isFutureSchedule && !NATIVE_SCHEDULE_SUPPORTED[platform]) {
-    return { action: "defer", result: { skipped: true, reason: `scheduled for ${new Date(scheduledMs).toISOString()}, not yet due` } };
+    // deferred, NOT skipped — a distinct state so decidePostingOutcome
+    // keeps the row at "approved" (not "posted"/"failed") while anything is
+    // still deferred, which is what keeps it visible to the sweep's
+    // `WHERE status = 'approved'` query. Conflating this with "skipped, no
+    // credentials" (which is fine to finalize around, since nothing further
+    // will ever happen for that platform) would silently strand rows —
+    // e.g. YouTube succeeds immediately via native scheduling while TikTok
+    // is still waiting, status would flip to "posted", and the sweep would
+    // never look at that row again to actually post to TikTok.
+    return { action: "defer", result: { deferred: true, reason: `scheduled for ${new Date(scheduledMs).toISOString()}, not yet due` } };
   }
 
   return { action: "attempt" };
@@ -574,18 +583,27 @@ async function runScheduledPostsSweep() {
 function decidePostingOutcome(results, priorStatus) {
   const values = Object.values(results);
   const anySuccess = values.some(r => r.success);
-  const anyAttempted = values.some(r => !r.skipped);
+  const anyAttempted = values.some(r => !r.skipped && !r.deferred);
+  // While anything is still deferred (scheduled, not yet due), the row must
+  // stay at "approved" regardless of what else happened this call — that's
+  // what keeps it visible to the sweep's `WHERE status = 'approved'` query.
+  // Otherwise e.g. YouTube succeeding immediately via native scheduling
+  // would finalize the row as "posted" while TikTok is still waiting, and
+  // nothing would ever come back to actually post it.
+  const anyDeferred = values.some(r => r.deferred);
 
   let status = priorStatus;
-  if (anySuccess) status = "posted";
-  else if (anyAttempted) status = "failed";
+  if (!anyDeferred) {
+    if (anySuccess) status = "posted";
+    else if (anyAttempted) status = "failed";
+  }
 
   const update = { platform_post_ids: results };
   if (status !== priorStatus) update.status = status;
   if (status === "posted") update.posted_at = new Date().toISOString();
   if (status === "failed") {
     update.error = Object.entries(results)
-      .filter(([, r]) => !r.success && !r.skipped)
+      .filter(([, r]) => !r.success && !r.skipped && !r.deferred)
       .map(([p, r]) => `${p}: ${r.error || "failed"}`)
       .join("; ");
   }
@@ -598,6 +616,7 @@ function decidePostingOutcome(results, priorStatus) {
 function describeResult(platform, r) {
   const label = platform.charAt(0).toUpperCase() + platform.slice(1);
   if (r.success) return `${label} posted ✓`;
+  if (r.deferred) return `${label} scheduled — ${escapeHtml(r.reason)}`;
   if (r.skipped) return `${label} skipped — ${escapeHtml(r.reason)}`;
   return `${label} failed — ${escapeHtml(r.error || "unknown error")}`;
 }
