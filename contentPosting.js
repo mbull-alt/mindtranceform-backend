@@ -249,18 +249,24 @@ async function postToYouTube(row) {
 }
 
 // NOTE on token lifetime: IG_ACCESS_TOKEN as currently issued (via Instagram
-// Business Login) is short-lived (~1hr). The documented ig_exchange_token
-// long-lived-token exchange is failing with "Error validating client secret"
-// against this app/token pair for reasons not yet root-caused (confirmed not
-// a copy-paste error — tried two distinct app secrets and two distinct
-// tokens, same result each time; the token itself works fine for real
-// Graph API calls, just not that specific exchange endpoint). Until that's
-// resolved, this token needs manual re-generation periodically — flagged
-// to Mark, not silently worked around.
+// Business Login) started short-lived (~1hr). The documented
+// ig_exchange_token long-lived-token exchange failed with "Error validating
+// client secret" against this app/token pair for reasons never root-caused
+// (confirmed not a copy-paste error — tried two distinct app secrets and two
+// distinct tokens, same result each time). Worked around via a DIFFERENT,
+// simpler endpoint instead: graph.instagram.com's ig_refresh_token grant,
+// which extends the token directly (~60 days per call, no client secret
+// needed) and works fine even on a token that never went through the
+// exchange flow. See tokenStore.js for the actual refresh-and-persist logic.
 async function postToInstagram(row) {
-  const { IG_ACCESS_TOKEN, IG_BUSINESS_ACCOUNT_ID } = process.env;
-  if (!IG_ACCESS_TOKEN || !IG_BUSINESS_ACCOUNT_ID) {
-    return { skipped: true, reason: "Instagram not configured (IG_ACCESS_TOKEN/IG_BUSINESS_ACCOUNT_ID not set)" };
+  const { IG_BUSINESS_ACCOUNT_ID } = process.env;
+  if (!IG_BUSINESS_ACCOUNT_ID) {
+    return { skipped: true, reason: "Instagram not configured (IG_BUSINESS_ACCOUNT_ID not set)" };
+  }
+  const { getValidInstagramToken } = require("./tokenStore");
+  const IG_ACCESS_TOKEN = await getValidInstagramToken();
+  if (!IG_ACCESS_TOKEN) {
+    return { skipped: true, reason: "Instagram not configured (IG_ACCESS_TOKEN not set)" };
   }
 
   try {
@@ -354,9 +360,10 @@ async function postToFacebook(row) {
 // configurable via env var like YouTube/Facebook's publish-status flags —
 // this one genuinely can't go public until/unless TikTok audits the app.
 async function postToTikTok(row) {
-  const { TIKTOK_ACCESS_TOKEN } = process.env;
+  const { getValidTikTokToken } = require("./tokenStore");
+  const TIKTOK_ACCESS_TOKEN = await getValidTikTokToken();
   if (!TIKTOK_ACCESS_TOKEN) {
-    return { skipped: true, reason: "TikTok not configured (TIKTOK_ACCESS_TOKEN not set)" };
+    return { skipped: true, reason: "TikTok not configured (TIKTOK_ACCESS_TOKEN/TIKTOK_REFRESH_TOKEN not set)" };
   }
 
   try {
