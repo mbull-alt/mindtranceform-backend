@@ -339,9 +339,14 @@ async function postToInstagram(row) {
 
     const caption = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}${linkSuffix(row)}`;
 
-    const createRes = await axios.post(`https://graph.instagram.com/v21.0/${IG_BUSINESS_ACCOUNT_ID}/media`, null, {
-      params: { media_type: "REELS", video_url: urlData.signedUrl, caption, access_token: IG_ACCESS_TOKEN },
-    });
+    // POST body (not query-string params) — sending rich text like the
+    // em-dash in CANONICAL_LINK_LINE via URL query params produced corrupted
+    // characters on Facebook's side (confirmed via postToFacebook, same
+    // underlying pattern); a form-encoded body avoids that entirely.
+    const createRes = await axios.post(
+      `https://graph.instagram.com/v21.0/${IG_BUSINESS_ACCOUNT_ID}/media`,
+      new URLSearchParams({ media_type: "REELS", video_url: urlData.signedUrl, caption, access_token: IG_ACCESS_TOKEN })
+    );
     const creationId = createRes.data.id;
 
     // Instagram processes the video asynchronously — poll until FINISHED
@@ -400,9 +405,13 @@ async function postToFacebook(row) {
     const description = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}${linkSuffix(row)}`;
     const published = process.env.FB_PUBLISH_LIVE === "true";
 
-    const res = await axios.post(`https://graph-video.facebook.com/v21.0/${FB_PAGE_ID}/videos`, null, {
-      params: { file_url: urlData.signedUrl, description, published, access_token: FB_PAGE_ACCESS_TOKEN },
-    });
+    // POST body, not query-string params — fixes the em-dash/UTF-8
+    // corruption confirmed on real posted content (2026-08-17): em-dashes
+    // in the description came through as "�" on Facebook's side.
+    const res = await axios.post(
+      `https://graph-video.facebook.com/v21.0/${FB_PAGE_ID}/videos`,
+      new URLSearchParams({ file_url: urlData.signedUrl, description, published: String(published), access_token: FB_PAGE_ACCESS_TOKEN })
+    );
 
     return {
       success: true,
