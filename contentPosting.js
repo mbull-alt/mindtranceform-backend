@@ -67,6 +67,17 @@ function hasRequiredLinks(caption, hashtags, cta) {
   return combined.includes(REQUIRED_LINK_WEB) && combined.includes(REQUIRED_LINK_PLAY);
 }
 
+// Used by every postTo* function instead of unconditionally appending
+// CANONICAL_LINK_LINE. Without this, a caller who already did the right
+// thing (embedded both links in caption/hashtags/cta, e.g. via the source
+// script's pinned-comment text, to satisfy queueContentPost's validation)
+// would see the link appear twice in the final posted text — once from
+// their own copy, once from the auto-append. Still guarantees the link is
+// present in the final output either way, just doesn't duplicate it.
+function linkSuffix(row) {
+  return hasRequiredLinks(row.caption, row.hashtags, row.cta) ? "" : `\n\n${CANONICAL_LINK_LINE}`;
+}
+
 // ─── queue ──────────────────────────────────────────────────────────────────
 
 async function queueContentPost({ video_path, script_slot, platform_targets, caption, hashtags, cta, scheduled_for }) {
@@ -276,7 +287,7 @@ async function postToYouTube(row) {
       requestBody: {
         snippet: {
           title: row.caption.length > 100 ? row.caption.slice(0, 97) + "..." : row.caption,
-          description: `${row.cta}\n\n${row.hashtags} #Shorts\n\n${CANONICAL_LINK_LINE}`,
+          description: `${row.cta}\n\n${row.hashtags} #Shorts${linkSuffix(row)}`,
           tags,
           categoryId: "26", // Howto & Style
         },
@@ -326,7 +337,7 @@ async function postToInstagram(row) {
       .createSignedUrl(row.video_path, 3600);
     if (urlErr) return { success: false, error: `signed url failed: ${urlErr.message}` };
 
-    const caption = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}\n\n${CANONICAL_LINK_LINE}`;
+    const caption = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}${linkSuffix(row)}`;
 
     const createRes = await axios.post(`https://graph.instagram.com/v21.0/${IG_BUSINESS_ACCOUNT_ID}/media`, null, {
       params: { media_type: "REELS", video_url: urlData.signedUrl, caption, access_token: IG_ACCESS_TOKEN },
@@ -386,7 +397,7 @@ async function postToFacebook(row) {
       .createSignedUrl(row.video_path, 3600);
     if (urlErr) return { success: false, error: `signed url failed: ${urlErr.message}` };
 
-    const description = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}\n\n${CANONICAL_LINK_LINE}`;
+    const description = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}${linkSuffix(row)}`;
     const published = process.env.FB_PUBLISH_LIVE === "true";
 
     const res = await axios.post(`https://graph-video.facebook.com/v21.0/${FB_PAGE_ID}/videos`, null, {
@@ -422,7 +433,7 @@ async function postToTikTok(row) {
     if (dlErr) return { success: false, error: `download from storage failed: ${dlErr.message}` };
     const videoBuffer = Buffer.from(await fileBlob.arrayBuffer());
 
-    const title = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}\n\n${CANONICAL_LINK_LINE}`.slice(0, 2200);
+    const title = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}${linkSuffix(row)}`.slice(0, 2200);
 
     const initRes = await axios.post(
       "https://open.tiktokapis.com/v2/post/publish/video/init/",
@@ -640,5 +651,6 @@ module.exports = {
   renderResultPage,
   escapeHtml,
   hasRequiredLinks,
+  linkSuffix,
   CANONICAL_LINK_LINE,
 };

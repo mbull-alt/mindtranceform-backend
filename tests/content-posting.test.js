@@ -14,6 +14,7 @@ const {
   renderResultPage,
   escapeHtml,
   hasRequiredLinks,
+  linkSuffix,
   CANONICAL_LINK_LINE,
 } = require("../contentPosting");
 
@@ -187,6 +188,18 @@ test("false when only the web link is present", () => {
 
 test("false when only the Play link is present", () => {
   assert.strictEqual(hasRequiredLinks("play.google.com/store/apps/details?id=com.mindtranceformapp.app.twa", "#tags", "cta"), false);
+});
+
+console.log("\nlinkSuffix");
+
+test("empty suffix when the row's own text already carries both links — avoids double-posting the link", () => {
+  const row = { caption: "caption", hashtags: "#tags", cta: `Try it — ${CANONICAL_LINK_LINE}` };
+  assert.strictEqual(linkSuffix(row), "");
+});
+
+test("appends CANONICAL_LINK_LINE when the row's own text is missing it — still guarantees it ends up in the final post", () => {
+  const row = { caption: "caption", hashtags: "#tags", cta: "Try it free" };
+  assert.strictEqual(linkSuffix(row), `\n\n${CANONICAL_LINK_LINE}`);
 });
 
 console.log("\ndecidePlatformAction");
