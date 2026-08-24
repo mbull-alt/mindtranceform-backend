@@ -118,36 +118,38 @@ describe("scoreAssessment — validation", () => {
   });
 });
 
-describe("scoreAssessment — item9Flag is always null (item 9 no longer exists)", () => {
-  test("phq8 never computes an item9Flag", () => {
+describe("scoreAssessment — item9Flag no longer exists in the result at all", () => {
+  // Was previously "always null" — now the key itself is absent, since
+  // item9_flag is never written to the DB anymore either (see server.js's
+  // POST /clinical-assessments insert and migrations/009_drop_item9_flag_column.sql).
+  test("phq8 result has no item9Flag key", () => {
     const result = scoreAssessment("phq8", { ...allZeros(8), q2: 3 });
-    expect(result.item9Flag).toBeNull();
+    expect(result).not.toHaveProperty("item9Flag");
   });
 
-  test("gad7 never computes an item9Flag", () => {
+  test("gad7 result has no item9Flag key", () => {
     const result = scoreAssessment("gad7", { ...allZeros(7), q7: 3 });
-    expect(result.item9Flag).toBeNull();
+    expect(result).not.toHaveProperty("item9Flag");
   });
 });
 
 describe("scoreAssessment — total score + severity band together", () => {
   test("phq8 all zeros → score 0, none/minimal", () => {
     const result = scoreAssessment("phq8", allZeros(8));
-    expect(result).toEqual({ totalScore: 0, severityBand: "none/minimal", item9Flag: null });
+    expect(result).toEqual({ totalScore: 0, severityBand: "none/minimal" });
   });
 
   test("phq8 all max (3s) → score 24, severe — no code path exceeds 24", () => {
     const result = scoreAssessment("phq8", allMax(8));
     expect(result.totalScore).toBe(24);
     expect(result.severityBand).toBe("severe");
-    expect(result.item9Flag).toBeNull();
+    expect(result).not.toHaveProperty("item9Flag");
   });
 
   test("gad7 all zeros → score 0, minimal", () => {
     expect(scoreAssessment("gad7", allZeros(7))).toEqual({
       totalScore: 0,
       severityBand: "minimal",
-      item9Flag: null,
     });
   });
 

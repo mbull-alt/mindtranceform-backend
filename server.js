@@ -558,8 +558,12 @@ app.get("/", (_req, res) => {
 });
 
 // Keep-alive target for UptimeRobot — prevents Render free-tier sleep.
+// commit: Render sets RENDER_GIT_COMMIT automatically on every deploy — lets
+// us confirm which commit is actually live instead of assuming a successful
+// `git push` means the new code is running (this project has a documented
+// history of that assumption being wrong).
 app.get("/healthz", (_req, res) => {
-  res.json({ status: "ok" });
+  res.json({ status: "ok", commit: process.env.RENDER_GIT_COMMIT || null });
 });
 
 // Register user profile + send welcome email
@@ -3179,7 +3183,10 @@ app.post("/clinical-assessments", requireAuth, async (req, res) => {
       responses,
       total_score: scored.totalScore,
       severity_band: scored.severityBand,
-      item9_flag: scored.item9Flag, // always null for phq8/gad7 — see lib/clinicalAssessments.js
+      // item9_flag intentionally omitted — the column still exists for now
+      // (drop is migrations/009_drop_item9_flag_column.sql, run once nothing
+      // reads it), but nothing writes to it anymore; Postgres defaults new
+      // rows' item9_flag to null on its own.
       phq8_equivalent_score: instrument === "phq8" ? scored.totalScore : null,
     })
     .select("id, taken_at")
