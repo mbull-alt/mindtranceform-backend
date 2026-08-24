@@ -25,7 +25,7 @@ describe("suppressBucket", () => {
 describe("computeOutcomeStats — cohort size gating", () => {
   test("9 eligible users (below MIN_COHORT) → null outcome numbers, real cohort_size", () => {
     const scoresByUser = usersWithScores(9, [15, 5]); // baseline 15, latest 5 — big improvement
-    const result = computeOutcomeStats("phq9", scoresByUser);
+    const result = computeOutcomeStats("phq8", scoresByUser);
     expect(result).toEqual({
       cohort_size: 9,
       avg_score_change: null,
@@ -36,7 +36,7 @@ describe("computeOutcomeStats — cohort size gating", () => {
 
   test("exactly 10 eligible users (at MIN_COHORT) → real outcome numbers", () => {
     const scoresByUser = usersWithScores(10, [15, 5]);
-    const result = computeOutcomeStats("phq9", scoresByUser);
+    const result = computeOutcomeStats("phq8", scoresByUser);
     expect(result.cohort_size).toBe(10);
     expect(result.avg_score_change).toBe(-10);
     expect(result.avg_baseline_severity).toBe("moderately severe");
@@ -46,13 +46,13 @@ describe("computeOutcomeStats — cohort size gating", () => {
   test("users with only 1 assessment are excluded from the cohort", () => {
     const eligible = usersWithScores(10, [15, 5]);
     const ineligible = usersWithScores(20, [10]); // only baseline, no follow-up
-    const result = computeOutcomeStats("phq9", [...eligible, ...ineligible]);
+    const result = computeOutcomeStats("phq8", [...eligible, ...ineligible]);
     expect(result.cohort_size).toBe(10);
   });
 
   test("uses first and last score, not just first two, for users with >2 assessments", () => {
     const scoresByUser = usersWithScores(10, [20, 12, 4]);
-    const result = computeOutcomeStats("phq9", scoresByUser);
+    const result = computeOutcomeStats("phq8", scoresByUser);
     expect(result.avg_score_change).toBe(-16);
   });
 
@@ -64,7 +64,7 @@ describe("computeOutcomeStats — cohort size gating", () => {
   });
 
   test("empty input → cohort_size 0, nulls", () => {
-    expect(computeOutcomeStats("phq9", [])).toEqual({
+    expect(computeOutcomeStats("phq8", [])).toEqual({
       cohort_size: 0,
       avg_score_change: null,
       avg_baseline_severity: null,
