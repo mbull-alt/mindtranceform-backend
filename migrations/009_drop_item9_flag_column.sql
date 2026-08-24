@@ -1,0 +1,21 @@
+-- Migration: drop the item9_flag column from clinical_assessments.
+-- Run once against the Supabase project via the SQL editor or CLI. Mark runs
+-- this himself — it is NOT auto-applied on deploy.
+--
+-- Deliberate follow-up to migrations/008_phq8_conversion.sql, not folded
+-- into it — see that file's header for why (dropping a column and scrubbing
+-- data in the same migration makes the rollback story worse if something
+-- breaks). By the time this runs:
+--   - 008 has already nulled item9_flag on every existing row.
+--   - The app's write path no longer sends item9_flag on insert at all
+--     (commit b654e8783481d278b92f4880eb8d81543c2ec6e2 in
+--     mindtranceform-backend) — confirmed actually deployed and live via
+--     GET /healthz reporting that exact commit, not just a successful push.
+--   - Nothing in either repo reads item9_flag anymore (grep -rn "item9"
+--     turns up only comments/docs and this migration itself).
+--
+-- safety_response_events is untouched here too, same as in 008 — see that
+-- file's header for the full rationale. This migration only concerns the
+-- item9_flag column.
+
+ALTER TABLE clinical_assessments DROP COLUMN IF EXISTS item9_flag;
