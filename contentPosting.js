@@ -426,9 +426,15 @@ async function postToFacebook(row) {
 }
 
 // Per the build spec's stop condition: no workaround for the SELF_ONLY
-// restriction on unaudited apps. privacy_level is hardcoded here, not
-// configurable via env var like YouTube/Facebook's publish-status flags —
-// this one genuinely can't go public until/unless TikTok audits the app.
+// restriction on unaudited apps — this one genuinely can't go public until/
+// unless TikTok audits the app.
+//
+// TikTok's Content Sharing Guidelines require querying creator_info/query/
+// immediately before every publish and posting with the privacy_level/
+// interaction settings that call actually returns, rather than an app just
+// assuming them. Skipping that call is what was causing every publish to be
+// rejected outright with "please review our integration guidelines" (found
+// 2026-08-25 — see platform_post_ids on the aug18-21 rows).
 async function postToTikTok(row) {
   const { getValidTikTokToken } = require("./tokenStore");
   const TIKTOK_ACCESS_TOKEN = await getValidTikTokToken();
@@ -438,6 +444,23 @@ async function postToTikTok(row) {
 
   try {
     const axios = require("axios");
+
+    const creatorInfoRes = await axios.post(
+      "https://open.tiktokapis.com/v2/post/publish/creator_info/query/",
+      {},
+      { headers: { Authorization: `Bearer ${TIKTOK_ACCESS_TOKEN}`, "Content-Type": "application/json" } }
+    );
+    if (creatorInfoRes.data.error?.code !== "ok") {
+      return { success: false, error: `creator_info query failed: ${creatorInfoRes.data.error?.message || "unknown"}` };
+    }
+    const creatorInfo = creatorInfoRes.data.data || {};
+    const privacyLevel = creatorInfo.privacy_level_options?.includes("SELF_ONLY")
+      ? "SELF_ONLY"
+      : creatorInfo.privacy_level_options?.[0];
+    if (!privacyLevel) {
+      return { success: false, error: "creator_info returned no privacy_level_options" };
+    }
+
     const { data: fileBlob, error: dlErr } = await getSupabase().storage.from(VIDEO_BUCKET).download(row.video_path);
     if (dlErr) return { success: false, error: `download from storage failed: ${dlErr.message}` };
     const videoBuffer = Buffer.from(await fileBlob.arrayBuffer());
@@ -447,7 +470,13 @@ async function postToTikTok(row) {
     const initRes = await axios.post(
       "https://open.tiktokapis.com/v2/post/publish/video/init/",
       {
-        post_info: { title, privacy_level: "SELF_ONLY", disable_duet: false, disable_comment: false, disable_stitch: false },
+        post_info: {
+          title,
+          privacy_level: privacyLevel,
+          disable_duet: !!creatorInfo.duet_disabled,
+          disable_comment: !!creatorInfo.comment_disabled,
+          disable_stitch: !!creatorInfo.stitch_disabled,
+        },
         source_info: { source: "FILE_UPLOAD", video_size: videoBuffer.length, chunk_size: videoBuffer.length, total_chunk_count: 1 },
       },
       { headers: { Authorization: `Bearer ${TIKTOK_ACCESS_TOKEN}`, "Content-Type": "application/json" } }
