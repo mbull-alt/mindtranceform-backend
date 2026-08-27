@@ -1428,23 +1428,31 @@ async function synthesizeChunkWithRetry(voiceId, chunkText, modelId, voiceSettin
         }
       );
     } catch (fetchErr) {
+      // Log on every attempt, including the last — previously the final
+      // attempt's error was discarded entirely (no warn, since that only
+      // fired on the "retrying" branch), so a consistent failure (e.g. bad
+      // credentials) never left a trace of its real cause in the logs, only
+      // the generic user-facing message below.
+      console.warn(`[elevenlabs] Network error attempt ${attempt + 1}: ${fetchErr.message}` +
+        (attempt === DELAYS_MS.length - 1 ? " — final attempt, giving up" : ` — retrying in ${DELAYS_MS[attempt + 1]}ms`));
       if (attempt === DELAYS_MS.length - 1)
         throw new Error("Voice synthesis is temporarily unavailable. Please try again shortly.");
-      console.warn(`[elevenlabs] Network error attempt ${attempt + 1}: ${fetchErr.message} — retrying in ${DELAYS_MS[attempt + 1]}ms`);
       continue;
     }
     if (!elevenRes.ok) {
       const errBody = await elevenRes.text();
+      console.warn(`[elevenlabs] HTTP ${elevenRes.status} attempt ${attempt + 1}: ${errBody.slice(0, 200)}` +
+        (attempt === DELAYS_MS.length - 1 ? " — final attempt, giving up" : ` — retrying in ${DELAYS_MS[attempt + 1]}ms`));
       if (attempt === DELAYS_MS.length - 1)
         throw new Error("Voice synthesis is temporarily unavailable. Please try again shortly.");
-      console.warn(`[elevenlabs] HTTP ${elevenRes.status} attempt ${attempt + 1}: ${errBody.slice(0, 200)} — retrying in ${DELAYS_MS[attempt + 1]}ms`);
       continue;
     }
     const buf = Buffer.from(await elevenRes.arrayBuffer());
     if (!buf.length) {
+      console.warn(`[elevenlabs] Empty audio attempt ${attempt + 1}` +
+        (attempt === DELAYS_MS.length - 1 ? " — final attempt, giving up" : ` — retrying in ${DELAYS_MS[attempt + 1]}ms`));
       if (attempt === DELAYS_MS.length - 1)
         throw new Error("Voice synthesis is temporarily unavailable. Please try again shortly.");
-      console.warn(`[elevenlabs] Empty audio attempt ${attempt + 1} — retrying in ${DELAYS_MS[attempt + 1]}ms`);
       continue;
     }
     return buf;
