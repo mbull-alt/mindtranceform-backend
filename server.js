@@ -1231,24 +1231,6 @@ app.post("/preview-voice", async (req, res) => {
   }
 });
 
-// TEMPORARY — Task 4 A/B sample generation, removed right after use.
-const STABILITY_AB_SAMPLES = { even: 0.75, flowing: 0.25 };
-app.get("/debug-stability-sample/:label", async (req, res) => {
-  const stability = STABILITY_AB_SAMPLES[req.params.label];
-  if (stability === undefined) return res.status(400).json({ error: "label must be 'even' or 'flowing'" });
-  try {
-    const r = await axios.post(
-      `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_MAP["Female Calm"]}`,
-      { text: PREVIEW_TEXT, model_id: "eleven_multilingual_v2", voice_settings: { ...PREVIEW_SETTINGS.voice_settings, stability } },
-      { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, responseType: "arraybuffer" }
-    );
-    res.set("Content-Type", "audio/mpeg");
-    res.send(Buffer.from(r.data));
-  } catch (err) {
-    res.status(err?.response?.status || 500).json({ error: "Sample generation failed" });
-  }
-});
-
 app.get("/test-elevenlabs", async (_req, res) => {
   const key = process.env.ELEVENLABS_API_KEY;
   if (!key) return res.json({ ok: false, error: "ELEVENLABS_API_KEY is not set" });
