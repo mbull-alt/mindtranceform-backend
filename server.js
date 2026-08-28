@@ -1004,6 +1004,7 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
       program, voice, background,
       script: cleanScript,
       technique: sessionTechnique,
+      delivery: normalizedDelivery,
       audio_base64: audioBase64,
       audio_url: storageAudioUrl,
       created_at: new Date().toISOString(),
