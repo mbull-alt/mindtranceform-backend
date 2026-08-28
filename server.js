@@ -1814,7 +1814,7 @@ Content rules:
 ${deepContext ? "8" : "7"}. Include 3 personalized affirmations tied directly to their goal. ${affirmGuides[affirmationStyle] || affirmGuides["I am"]}
 ${deepContext ? "9" : "8"}. ${endings[program] || "End positively."}
 ${deepContext ? "10" : "9"}. Style: ${styleGuides[style] || styleGuides["Gentle Meditation"]}
-${deepContext ? "11" : "10"}. Background: ${intensityGuides[backgroundIntensity] || intensityGuides["Balanced"]}
+${deepContext ? "11" : "10"}. Background: ${background === "None" ? "No background sound was chosen — do not reference any ambient sound, tone, or frequency; the voice is the only audio." : (intensityGuides[backgroundIntensity] || intensityGuides["Balanced"])}
 ${deepContext ? "12" : "11"}. Output ONLY the script. No titles, labels, or commentary.
 
 TECHNIQUE TAG — you MUST begin your entire response with exactly this format, then immediately write the session script with no blank line between:
