@@ -647,13 +647,13 @@ app.post("/verify-payment", async (req, res) => {
 });
 
 app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => {
-  const { name: rawName, goal: rawGoal, program: rawProgram, voice, background, length, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, pace, free_text_intent } = req.body;
+  const { name: rawName, goal: rawGoal, program: rawProgram, voice, background, length, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, pace, delivery, free_text_intent } = req.body;
   const isFastEntry = !!free_text_intent;
   const name = (rawName || "").trim() || (isFastEntry ? "there" : rawName);
   const program = isFastEntry ? inferProgramFromFreeText(free_text_intent) : rawProgram;
   const goal = isFastEntry ? free_text_intent : rawGoal;
   const inferredProgram = isFastEntry ? program : null;
-  console.log(`[generate] Received: name=${name}, program=${program}, length=${length}, style=${style}, personalization=${personalization}, pace=${pace}, fastEntry=${isFastEntry}`);
+  console.log(`[generate] Received: name=${name}, program=${program}, length=${length}, style=${style}, personalization=${personalization}, pace=${pace}, delivery=${delivery}, fastEntry=${isFastEntry}`);
   if (!name || !goal || !program) return res.status(400).json({ success: false, error: "Name, goal, and program are required." });
 
   // ─── GUEST SESSION LIMIT ──────────────────────────────────────────────────
@@ -737,6 +737,11 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
   const normalizedPace = (pace || "slow").toLowerCase();
   const pacedWpm   = WPM_BY_PACE[normalizedPace]  ?? 100;
   const pacedSpeed = SPEED_BY_PACE[normalizedPace] ?? 0.75;
+  // Voice delivery (Task 4) — separate from pace: pace drives word-count/speed
+  // math above, delivery only affects ElevenLabs stability (expressiveness).
+  const STABILITY_BY_DELIVERY = { flowing: 0.25, even: 0.75 };
+  const normalizedDelivery = (delivery || "flowing").toLowerCase();
+  const deliveryStability = STABILITY_BY_DELIVERY[normalizedDelivery] ?? 0.40;
   const wordTarget = Math.round(mins * pacedWpm);
   // maxTokens: scale with session length; minimum 2000 to prevent cut-off on short sessions.
   // At ~1.3 tokens/word plus SSML overhead, a 1890-word script needs ~3500 tokens minimum.
@@ -904,8 +909,8 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
 
     const ttsChunks = splitIntoTTSChunks(ssmlScript, ELEVENLABS_CHUNK_LIMIT);
     const modelId = "eleven_multilingual_v2";
-    const voiceSettings = { stability: 0.40, similarity_boost: 0.80, style: 0.20, use_speaker_boost: true, speed: pacedSpeed };
-    console.log(`[generate] pace=${normalizedPace} speed=${pacedSpeed} wpm=${pacedWpm} wordTarget=${wordTarget}`);
+    const voiceSettings = { stability: deliveryStability, similarity_boost: 0.80, style: 0.20, use_speaker_boost: true, speed: pacedSpeed };
+    console.log(`[generate] pace=${normalizedPace} speed=${pacedSpeed} wpm=${pacedWpm} wordTarget=${wordTarget} delivery=${normalizedDelivery} stability=${deliveryStability}`);
 
     // ── SCRIPT STATS — ground truth before TTS ────────────────────────────────
     const scriptBreakMatches = [...ssmlScript.matchAll(/<break\s+time="([\d.]+)s"\s*\/>/g)];
