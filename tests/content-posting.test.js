@@ -16,6 +16,8 @@ const {
   hasRequiredLinks,
   linkSuffix,
   CANONICAL_LINK_LINE,
+  buildTikTokInboxInitPayload,
+  decideTikTokPollOutcome,
 } = require("../contentPosting");
 
 let passed = 0;
@@ -248,6 +250,49 @@ test("unknown platform -> unknown action with an error result, not a crash", () 
   assert.strictEqual(result.action, "unknown");
   assert.strictEqual(result.result.success, false);
   assert.ok(result.result.error.includes("myspace"));
+});
+
+console.log("\nbuildTikTokInboxInitPayload");
+
+test("body contains only source_info, no post_info field of any kind", () => {
+  const body = buildTikTokInboxInitPayload(12345);
+  assert.deepStrictEqual(body, {
+    source_info: { source: "FILE_UPLOAD", video_size: 12345, chunk_size: 12345, total_chunk_count: 1 },
+  });
+  assert.strictEqual(body.post_info, undefined, "inbox/video/init/ accepts no post_info — sending one is a Direct Post leftover");
+});
+
+test("chunk_size equals video_size (single-chunk upload, matches the rest of postToTikTok)", () => {
+  const body = buildTikTokInboxInitPayload(999);
+  assert.strictEqual(body.source_info.chunk_size, body.source_info.video_size);
+  assert.strictEqual(body.source_info.total_chunk_count, 1);
+});
+
+console.log("\ndecideTikTokPollOutcome");
+
+test("SEND_TO_USER_INBOX is terminal success — this is the state our side actually controls", () => {
+  assert.deepStrictEqual(decideTikTokPollOutcome("SEND_TO_USER_INBOX"), { terminal: true, success: true });
+});
+
+test("PUBLISH_COMPLETE also counts as success if it happens to arrive in time", () => {
+  assert.deepStrictEqual(decideTikTokPollOutcome("PUBLISH_COMPLETE"), { terminal: true, success: true });
+});
+
+test("FAILED is terminal failure", () => {
+  assert.deepStrictEqual(decideTikTokPollOutcome("FAILED"), { terminal: true, success: false });
+});
+
+test("PROCESSING_UPLOAD/PROCESSING_DOWNLOAD are not terminal — keep polling", () => {
+  assert.deepStrictEqual(decideTikTokPollOutcome("PROCESSING_UPLOAD"), { terminal: false, success: false });
+  assert.deepStrictEqual(decideTikTokPollOutcome("PROCESSING_DOWNLOAD"), { terminal: false, success: false });
+});
+
+test("REGRESSION: must not wait for PUBLISH_COMPLETE specifically — the old Direct Post polling logic " +
+     "would report every real inbox success as a failure, since PUBLISH_COMPLETE for this flow only " +
+     "fires once a human finishes the post in the TikTok app, which can take hours or never happen", () => {
+  const outcome = decideTikTokPollOutcome("SEND_TO_USER_INBOX");
+  assert.strictEqual(outcome.terminal, true);
+  assert.strictEqual(outcome.success, true, "SEND_TO_USER_INBOX must count as success on its own, not just PUBLISH_COMPLETE");
 });
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

@@ -119,7 +119,7 @@ async function queueContentPost({ video_path, script_slot, platform_targets, cap
 
   if (error) throw Object.assign(new Error(`insert failed: ${error.message}`), { statusCode: 500 });
 
-  await sendApprovalEmail({ id: data.id, video_path, script_slot, platform_targets, caption, approval_token, scheduled_for: scheduledForIso });
+  await sendApprovalEmail({ id: data.id, video_path, script_slot, platform_targets, caption, hashtags, cta, approval_token, scheduled_for: scheduledForIso });
 
   return { id: data.id, status: "pending" };
 }
@@ -141,7 +141,7 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-async function sendApprovalEmail({ id, video_path, script_slot, platform_targets, caption, approval_token, scheduled_for }) {
+async function sendApprovalEmail({ id, video_path, script_slot, platform_targets, caption, hashtags, cta, approval_token, scheduled_for }) {
   const adminEmail = process.env.ADMIN_EMAIL;
   if (!adminEmail) {
     console.error(`[content_posts] ADMIN_EMAIL not set — cannot send approval email for row ${id}`);
@@ -156,6 +156,22 @@ async function sendApprovalEmail({ id, video_path, script_slot, platform_targets
     ? `<strong>Scheduled for:</strong> ${escapeHtml(new Date(scheduled_for).toLocaleString("en-US", { timeZone: "America/New_York", dateStyle: "medium", timeStyle: "short" }))} ET<br>`
     : "";
 
+  // TikTok's inbox/draft upload API takes no caption/title field at all
+  // (confirmed against TikTok's current API reference, 2026-09-02) — the
+  // creator types it themselves when they open the draft in the TikTok app.
+  // Surface the full text here rather than silently dropping it, so it's
+  // not lost between approval and whoever finishes the post in-app.
+  const tiktokNote = platform_targets.includes("tiktok")
+    ? `<p style="background:#fff7ed;border-left:4px solid #f97316;padding:12px 16px;">
+        <strong>TikTok note:</strong> approving sends this video to the TikTok inbox as a draft —
+        TikTok's API doesn't support a pre-filled caption for that flow, so paste the text below
+        into the TikTok app yourself when you finish the post there.
+      </p>
+      <p><strong>Caption/CTA/hashtags for TikTok:</strong><br>
+        <pre style="white-space:pre-wrap;background:#f3f4f6;padding:12px;border-radius:6px;font-family:inherit;">${escapeHtml(caption)}\n\n${escapeHtml(cta)}\n\n${escapeHtml(hashtags)}</pre>
+      </p>`
+    : "";
+
   const html = `
     <p>A new video is ready for review.</p>
     <p>
@@ -167,6 +183,7 @@ async function sendApprovalEmail({ id, video_path, script_slot, platform_targets
     ${videoUrl
       ? `<p><a href="${videoUrl}">Watch it</a></p>`
       : `<p>(Video preview link unavailable — check content_posts row ${id} in Supabase.)</p>`}
+    ${tiktokNote}
     <p>
       <a href="${approveUrl}" style="background:#22c55e;color:#fff;padding:10px 16px;text-decoration:none;border-radius:6px;display:inline-block;">${scheduled_for ? "Approve (posts at scheduled time)" : "Approve and post now"}</a>
       &nbsp;&nbsp;
@@ -425,16 +442,50 @@ async function postToFacebook(row) {
   }
 }
 
-// Per the build spec's stop condition: no workaround for the SELF_ONLY
-// restriction on unaudited apps — this one genuinely can't go public until/
-// unless TikTok audits the app.
-//
-// TikTok's Content Sharing Guidelines require querying creator_info/query/
-// immediately before every publish and posting with the privacy_level/
-// interaction settings that call actually returns, rather than an app just
-// assuming them. Skipping that call is what was causing every publish to be
-// rejected outright with "please review our integration guidelines" (found
-// 2026-08-25 — see platform_post_ids on the aug18-21 rows).
+// Pure — the exact request body for the inbox/draft video init call.
+// Deliberately just source_info: confirmed against TikTok's current API
+// reference (developers.tiktok.com/doc/content-posting-api-reference-
+// upload-video, checked 2026-09-02) that /inbox/video/init/ accepts no
+// post_info field at all — title, privacy_level, disable_duet,
+// disable_comment, disable_stitch are all Direct Post-only and either
+// ignored or rejected here. There is no way to pre-fill a caption for this
+// mode; the creator types it themselves when they open the draft in the
+// TikTok app (see the TikTok note added to sendApprovalEmail below).
+function buildTikTokInboxInitPayload(videoSize) {
+  return {
+    source_info: {
+      source: "FILE_UPLOAD",
+      video_size: videoSize,
+      chunk_size: videoSize,
+      total_chunk_count: 1,
+    },
+  };
+}
+
+// Pure — interprets one status/fetch response for the inbox/draft flow.
+// SEND_TO_USER_INBOX, not PUBLISH_COMPLETE, is the terminal state our side
+// controls: per TikTok's Get Post Status reference (checked 2026-09-02),
+// PUBLISH_COMPLETE for the upload/inbox flow only fires after a human opens
+// the TikTok app and finishes the post themselves — that can take hours or
+// never happen, so waiting for it here would report every successful inbox
+// upload as a failure once the poll ceiling is hit. PUBLISH_COMPLETE still
+// counts as success if it happens to land within the poll window anyway.
+function decideTikTokPollOutcome(status) {
+  if (status === "SEND_TO_USER_INBOX" || status === "PUBLISH_COMPLETE") return { terminal: true, success: true };
+  if (status === "FAILED") return { terminal: true, success: false };
+  return { terminal: false, success: false };
+}
+
+// Sends the finished video to the creator's TikTok inbox as a draft — this
+// app's Developer Portal config holds only user.info.basic + video.upload
+// and has Direct Post disabled (confirmed in the portal 2026-09-02), so the
+// Direct Post video/init/ call this used to make could never have succeeded
+// regardless of the creator_info/privacy_level handling that used to sit
+// around it; video.upload is exactly the scope the inbox/draft flow needs
+// (video.publish is the Direct Post-only scope, confirmed against TikTok's
+// docs 2026-09-02) and Direct Post's SELF_ONLY-for-unaudited-apps restriction
+// doesn't apply here in the first place, since inbox drafts are never public
+// until the creator manually posts them.
 async function postToTikTok(row) {
   const { getValidTikTokToken } = require("./tokenStore");
   const TIKTOK_ACCESS_TOKEN = await getValidTikTokToken();
@@ -445,40 +496,13 @@ async function postToTikTok(row) {
   try {
     const axios = require("axios");
 
-    const creatorInfoRes = await axios.post(
-      "https://open.tiktokapis.com/v2/post/publish/creator_info/query/",
-      {},
-      { headers: { Authorization: `Bearer ${TIKTOK_ACCESS_TOKEN}`, "Content-Type": "application/json" } }
-    );
-    if (creatorInfoRes.data.error?.code !== "ok") {
-      return { success: false, error: `creator_info query failed: ${creatorInfoRes.data.error?.message || "unknown"}` };
-    }
-    const creatorInfo = creatorInfoRes.data.data || {};
-    const privacyLevel = creatorInfo.privacy_level_options?.includes("SELF_ONLY")
-      ? "SELF_ONLY"
-      : creatorInfo.privacy_level_options?.[0];
-    if (!privacyLevel) {
-      return { success: false, error: "creator_info returned no privacy_level_options" };
-    }
-
     const { data: fileBlob, error: dlErr } = await getSupabase().storage.from(VIDEO_BUCKET).download(row.video_path);
     if (dlErr) return { success: false, error: `download from storage failed: ${dlErr.message}` };
     const videoBuffer = Buffer.from(await fileBlob.arrayBuffer());
 
-    const title = `${row.caption}\n\n${row.cta}\n\n${row.hashtags}${linkSuffix(row)}`.slice(0, 2200);
-
     const initRes = await axios.post(
-      "https://open.tiktokapis.com/v2/post/publish/video/init/",
-      {
-        post_info: {
-          title,
-          privacy_level: privacyLevel,
-          disable_duet: !!creatorInfo.duet_disabled,
-          disable_comment: !!creatorInfo.comment_disabled,
-          disable_stitch: !!creatorInfo.stitch_disabled,
-        },
-        source_info: { source: "FILE_UPLOAD", video_size: videoBuffer.length, chunk_size: videoBuffer.length, total_chunk_count: 1 },
-      },
+      "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/",
+      buildTikTokInboxInitPayload(videoBuffer.length),
       { headers: { Authorization: `Bearer ${TIKTOK_ACCESS_TOKEN}`, "Content-Type": "application/json" } }
     );
     if (initRes.data.error?.code !== "ok") {
@@ -495,7 +519,8 @@ async function postToTikTok(row) {
       maxBodyLength: Infinity,
     });
 
-    // Poll for completion — TikTok processes the upload asynchronously.
+    // Poll until the video actually reaches the creator's inbox — see
+    // decideTikTokPollOutcome above for why this isn't PUBLISH_COMPLETE.
     let status = "PROCESSING_UPLOAD";
     for (let i = 0; i < 30; i++) {
       await new Promise(r => setTimeout(r, 5000));
@@ -505,13 +530,13 @@ async function postToTikTok(row) {
         { headers: { Authorization: `Bearer ${TIKTOK_ACCESS_TOKEN}`, "Content-Type": "application/json" } }
       );
       status = statusRes.data.data?.status;
-      if (status === "PUBLISH_COMPLETE" || status === "FAILED") break;
+      if (decideTikTokPollOutcome(status).terminal) break;
     }
-    if (status !== "PUBLISH_COMPLETE") {
-      return { success: false, error: `publish never completed (status: ${status})` };
+    if (!decideTikTokPollOutcome(status).success) {
+      return { success: false, error: `upload never reached the creator's inbox (status: ${status})` };
     }
 
-    return { success: true, post_id: publish_id, privacyLevel: "SELF_ONLY" };
+    return { success: true, post_id: publish_id, mode: "inbox_draft" };
   } catch (err) {
     const detail = err.response?.data?.error?.message || err.message;
     return { success: false, error: `TikTok publish failed: ${detail}` };
@@ -691,4 +716,6 @@ module.exports = {
   hasRequiredLinks,
   linkSuffix,
   CANONICAL_LINK_LINE,
+  buildTikTokInboxInitPayload,
+  decideTikTokPollOutcome,
 };

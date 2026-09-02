@@ -3,8 +3,10 @@
  * access. Mirrors instagramAuth.js/facebookAuth.js's shape.
  *
  * Flow: TikTok redirects here with ?code=&state= after Mark authorizes via
- * TikTok Login Kit (scope: video.publish). Exchanges the code for an
- * access_token + refresh_token and shows both for copying.
+ * TikTok Login Kit (scope: user.info.basic,video.upload — Direct Post is
+ * disabled in the app's Developer Portal config, confirmed 2026-09-02;
+ * video.publish, the Direct Post scope, was never granted). Exchanges the
+ * code for an access_token + refresh_token and shows both for copying.
  *
  * Token lifetimes (per TikTok's docs, checked 2026-08-15): access_token
  * valid 24 hours, refresh_token valid 365 days. postToTikTok uses the
@@ -12,10 +14,11 @@
  * implemented yet — flagged as a known gap, same as Instagram's token
  * lifetime issue.
  *
- * Unaudited apps (this one, until/unless a TikTok audit is submitted and
- * approved) are restricted to SELF_ONLY visibility regardless of what
- * privacy_level is requested — enforced by TikTok itself, not something
- * to work around.
+ * postToTikTok (contentPosting.js) posts via the inbox/draft upload flow,
+ * not Direct Post — it sends no privacy_level, since that endpoint takes no
+ * post_info at all (confirmed 2026-09-02). The Direct Post SELF_ONLY
+ * restriction for unaudited apps doesn't apply to this flow: inbox drafts
+ * are never public until the creator manually finishes the post in-app.
  */
 
 "use strict";
