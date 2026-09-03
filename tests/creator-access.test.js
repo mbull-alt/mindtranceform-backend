@@ -3,7 +3,7 @@
 // No external dependencies — uses Node.js built-in assert.
 
 const assert = require("assert");
-const { isEntitledToPro, parseCookies, computeDeviceFingerprint } = require("../creatorAccess");
+const { isEntitledToPro, parseCookies, computeDeviceFingerprint, effectivePlan, shouldEnforceDeviceCap } = require("../creatorAccess");
 
 let passed = 0;
 let failed = 0;
@@ -92,6 +92,93 @@ test("is deterministic with same inputs", () => {
   const f1 = computeDeviceFingerprint(req, "cookie-abc");
   const f2 = computeDeviceFingerprint(req, "cookie-abc");
   assert.strictEqual(f1, f2);
+});
+
+console.log("\neffectivePlan");
+
+test("no profile -> null", () => {
+  assert.strictEqual(effectivePlan(null), null);
+});
+
+test("plan: null, active pro grant, no expiry -> pro", () => {
+  assert.strictEqual(
+    effectivePlan({ plan: null, is_subscriber: false, creator_access_active: true, creator_access_tier: "pro", creator_access_expires_at: null }),
+    "pro"
+  );
+});
+
+test("plan: null, active grant, expired -> null — the 12-month-renewable protection; the most important case here", () => {
+  const past = new Date(Date.now() - 1000).toISOString();
+  assert.strictEqual(
+    effectivePlan({ plan: null, is_subscriber: false, creator_access_active: true, creator_access_tier: "pro", creator_access_expires_at: past }),
+    null
+  );
+});
+
+test("plan: single, active pro grant -> pro — comp beats paid", () => {
+  assert.strictEqual(
+    effectivePlan({ plan: "single", is_subscriber: false, creator_access_active: true, creator_access_tier: "pro", creator_access_expires_at: null }),
+    "pro"
+  );
+});
+
+test("plan: pro, is_subscriber: true, expired grant -> pro — paid tier unaffected by grant expiry", () => {
+  const past = new Date(Date.now() - 1000).toISOString();
+  assert.strictEqual(
+    effectivePlan({ plan: "pro", is_subscriber: true, creator_access_active: true, creator_access_tier: "premium", creator_access_expires_at: past }),
+    "pro"
+  );
+});
+
+test("creator_access_active: false, plan: premium -> premium", () => {
+  assert.strictEqual(
+    effectivePlan({ plan: "premium", is_subscriber: false, creator_access_active: false, creator_access_tier: "pro", creator_access_expires_at: null }),
+    "premium"
+  );
+});
+
+test("unknown/garbage creator_access_tier with an active grant -> pro, not the raw garbage string", () => {
+  assert.strictEqual(
+    effectivePlan({ plan: null, is_subscriber: false, creator_access_active: true, creator_access_tier: "legacy_vip_v2", creator_access_expires_at: null }),
+    "pro"
+  );
+});
+
+console.log("\nshouldEnforceDeviceCap");
+
+test("subscriber -> false — paying subscribers never hit device-cap logic", () => {
+  assert.strictEqual(
+    shouldEnforceDeviceCap({ is_subscriber: true, creator_access_active: true, creator_access_device_cap: 5 }),
+    false
+  );
+});
+
+test("creator_access_active: false -> false", () => {
+  assert.strictEqual(
+    shouldEnforceDeviceCap({ is_subscriber: false, creator_access_active: false, creator_access_device_cap: 5 }),
+    false
+  );
+});
+
+test("active with cap null -> false — the uncapped org/pilot/clinic case", () => {
+  assert.strictEqual(
+    shouldEnforceDeviceCap({ is_subscriber: false, creator_access_active: true, creator_access_device_cap: null }),
+    false
+  );
+});
+
+test("active with cap 0 -> false", () => {
+  assert.strictEqual(
+    shouldEnforceDeviceCap({ is_subscriber: false, creator_access_active: true, creator_access_device_cap: 0 }),
+    false
+  );
+});
+
+test("active with cap 5 -> true — the capped influencer/creator case", () => {
+  assert.strictEqual(
+    shouldEnforceDeviceCap({ is_subscriber: false, creator_access_active: true, creator_access_device_cap: 5 }),
+    true
+  );
 });
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

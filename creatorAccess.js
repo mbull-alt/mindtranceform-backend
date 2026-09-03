@@ -12,6 +12,22 @@ function isEntitledToPro(profile) {
   return true;
 }
 
+const PLAN_RANK = { single: 1, premium: 2, pro: 3 };
+
+// Highest tier the user is entitled to right now: the greater of what they pay
+// for and what they have been comped. Returns null for no entitlement.
+// Creator grants expire via isEntitledToPro(); `plan` never does — keep them separate.
+function effectivePlan(profile) {
+  if (!profile) return null;
+  const paid = PLAN_RANK[profile.plan] ? profile.plan : null;
+  const comped = isEntitledToPro(profile) && !profile.is_subscriber
+    ? (PLAN_RANK[profile.creator_access_tier] ? profile.creator_access_tier : "pro")
+    : null;
+  if (!paid) return comped;
+  if (!comped) return paid;
+  return PLAN_RANK[comped] > PLAN_RANK[paid] ? comped : paid;
+}
+
 // Minimal cookie parser — avoids adding cookie-parser dependency.
 function parseCookies(cookieHeader) {
   const cookies = {};
@@ -37,9 +53,24 @@ function computeDeviceFingerprint(req, deviceIdCookie) {
   return crypto.createHash("sha256").update(`${ua}|${lang}|${deviceId}|${ip24}`).digest("hex");
 }
 
-// Enforces the per-creator device cap.
-// Known devices (seen in last 30 days, not revoked) are refreshed and allowed.
-// New devices are counted; if count >= cap, throws DEVICE_CAP_EXCEEDED.
+// Device cap exists to limit login sharing on influencer/creator grants.
+// Org, clinic and pilot grants are uncapped: creator_access_device_cap IS NULL.
+// Decided 2026-09-03, after the 2026-09-01 App Review 403 — a cap of 2 locked
+// a reviewer out on their second device, with no support-desk device-release
+// procedure behind the resulting "contact support" message.
+function shouldEnforceDeviceCap(profile) {
+  if (!profile) return false;
+  if (profile.is_subscriber) return false;
+  if (!profile.creator_access_active) return false;
+  const cap = profile.creator_access_device_cap;
+  return typeof cap === "number" && cap > 0;
+}
+
+// Enforces the per-creator device cap. Only ever called when
+// shouldEnforceDeviceCap(profile) is true, so deviceCap is always a real
+// positive number here — no fallback needed. Known devices (seen in last 30
+// days, not revoked) are refreshed and allowed; new devices are counted, and
+// if count >= cap, throws DEVICE_CAP_EXCEEDED.
 async function enforceDeviceCap(supabase, userId, fingerprint, deviceCap) {
   const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
@@ -94,5 +125,8 @@ module.exports = {
   parseCookies,
   computeDeviceFingerprint,
   enforceDeviceCap,
+  shouldEnforceDeviceCap,
   appendAuditLog,
+  effectivePlan,
+  PLAN_RANK,
 };

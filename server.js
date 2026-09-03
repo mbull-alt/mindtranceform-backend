@@ -19,7 +19,7 @@ const { handleFacebookCallback } = require("./facebookAuth");
 const { handleTikTokCallback } = require("./tiktokAuth");
 const { classifyPrompt } = require("./safety/topicClassifier");
 const { llmIntentCheck } = require("./safety/intentClassifier");
-const { isEntitledToPro, parseCookies, computeDeviceFingerprint, enforceDeviceCap } = require("./creatorAccess");
+const { isEntitledToPro, parseCookies, computeDeviceFingerprint, enforceDeviceCap, shouldEnforceDeviceCap, effectivePlan } = require("./creatorAccess");
 const { goalLabelForProgram, assessmentTypeForProgram, questionsForType } = require("./lib/goalLabels");
 const { computeStreaks, buildHeatmap, shouldOfferReassessment } = require("./lib/streaks");
 const { STEM, ANSWER_SCALE, ATTRIBUTION, itemsForInstrument, scoreAssessment, severityBand } = require("./lib/clinicalAssessments");
@@ -1843,8 +1843,11 @@ app.post("/auth/verify", requireAuth, async (req, res) => {
 
     const entitled = isEntitledToPro(profile);
 
-    // Device cap enforcement for active creator accounts (not paying subscribers)
-    if (profile?.creator_access_active && !profile?.is_subscriber) {
+    // Device cap enforcement — only for capped creator grants (influencer/
+    // creator accounts). Uncapped grants (org/clinic/pilot — see
+    // shouldEnforceDeviceCap) skip this whole block, including the device_id
+    // cookie write: no device-related friction of any kind for those.
+    if (shouldEnforceDeviceCap(profile)) {
       const cookies  = parseCookies(req.headers.cookie);
       const deviceId = cookies["device_id"] || randomUUID();
       res.cookie("device_id", deviceId, {
@@ -1855,7 +1858,7 @@ app.post("/auth/verify", requireAuth, async (req, res) => {
       });
       const fingerprint = computeDeviceFingerprint(req, deviceId);
       try {
-        await enforceDeviceCap(supabase, req.user.id, fingerprint, profile.creator_access_device_cap || 2);
+        await enforceDeviceCap(supabase, req.user.id, fingerprint, profile.creator_access_device_cap);
       } catch (capErr) {
         if (capErr.code === "DEVICE_CAP_EXCEEDED") {
           return res.status(403).json({
@@ -1874,6 +1877,7 @@ app.post("/auth/verify", requireAuth, async (req, res) => {
       email:              req.user.email || null,
       guest:              !req.user.email,
       plan:               profile?.plan || null,
+      effective_plan:     effectivePlan(profile),
       status:             profile?.subscription_status || "free",
       is_subscriber:      profile?.is_subscriber || false,
       is_entitled_to_pro: entitled,
