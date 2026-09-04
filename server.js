@@ -16,7 +16,7 @@ const { runDailyContentGeneration, runDailyOutreach, runWeeklyContentGeneration 
 const { queueContentPost, approveContentPost, rejectContentPost, runScheduledPostsSweep, describeResult, renderResultPage } = require("./contentPosting");
 const { handleInstagramCallback, handleDeauthorize, handleDataDeletionInstructions } = require("./instagramAuth");
 const { handleFacebookCallback } = require("./facebookAuth");
-const { handleTikTokCallback } = require("./tiktokAuth");
+const { handleTikTokStart, handleTikTokCallback, handleTikTokStatus } = require("./tiktokAuth");
 const { classifyPrompt } = require("./safety/topicClassifier");
 const { llmIntentCheck } = require("./safety/intentClassifier");
 const { isEntitledToPro, parseCookies, computeDeviceFingerprint, enforceDeviceCap, shouldEnforceDeviceCap, effectivePlan } = require("./creatorAccess");
@@ -2675,7 +2675,12 @@ app.get("/auth/instagram/callback", handleInstagramCallback);
 app.post("/auth/instagram/deauthorize", express.urlencoded({ extended: false }), handleDeauthorize);
 app.get("/auth/instagram/data-deletion", handleDataDeletionInstructions);
 app.get("/auth/facebook/callback", handleFacebookCallback);
+// Not requireAdmin-gated — see the comment on handleTikTokStart in
+// tiktokAuth.js for why header-based admin auth can't wrap a browser
+// redirect flow, and what actually limits exposure here.
+app.get("/auth/tiktok/start", handleTikTokStart);
 app.get("/auth/tiktok/callback", handleTikTokCallback);
+app.get("/content/tiktok-status", requireAdmin, handleTikTokStatus);
 
 // Meta's webhook verification handshake: GET with hub.mode/hub.challenge/
 // hub.verify_token — must echo back hub.challenge as plain text, and only

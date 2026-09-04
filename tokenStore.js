@@ -48,10 +48,11 @@ async function getStoredToken(platform) {
   return data;
 }
 
-async function saveToken(platform, { access_token, refresh_token, access_token_expires_at, refresh_token_expires_at }) {
+async function saveToken(platform, { access_token, refresh_token, access_token_expires_at, refresh_token_expires_at, scope }) {
   const { error } = await getSupabase().from("platform_tokens").upsert({
     platform, access_token, refresh_token: refresh_token ?? null,
     access_token_expires_at, refresh_token_expires_at: refresh_token_expires_at ?? null,
+    scope: scope ?? null,
     updated_at: new Date().toISOString(),
   });
   if (error) throw new Error(`platform_tokens save failed: ${error.message}`);
@@ -114,11 +115,13 @@ async function getValidTikTokToken() {
     }),
     { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
   );
-  const { access_token, refresh_token, expires_in, refresh_expires_in } = res.data;
+  const { access_token, refresh_token, expires_in, refresh_expires_in, scope } = res.data;
   const access_token_expires_at = new Date(Date.now() + expires_in * 1000).toISOString();
   const refresh_token_expires_at = new Date(Date.now() + refresh_expires_in * 1000).toISOString();
-  await saveToken("tiktok", { access_token, refresh_token, access_token_expires_at, refresh_token_expires_at });
+  // TikTok's refresh_token grant doesn't always echo scope back — fall back
+  // to what's already stored rather than overwriting it with null.
+  await saveToken("tiktok", { access_token, refresh_token, access_token_expires_at, refresh_token_expires_at, scope: scope || stored.scope || null });
   return access_token;
 }
 
-module.exports = { getValidInstagramToken, getValidTikTokToken };
+module.exports = { getValidInstagramToken, getValidTikTokToken, getSupabase };
