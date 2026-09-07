@@ -24,6 +24,7 @@ const { goalLabelForProgram, assessmentTypeForProgram, questionsForType } = requ
 const { computeStreaks, buildHeatmap, shouldOfferReassessment } = require("./lib/streaks");
 const { STEM, ANSWER_SCALE, ATTRIBUTION, itemsForInstrument, scoreAssessment, severityBand } = require("./lib/clinicalAssessments");
 const { suppressBucket, computeOutcomeStats } = require("./lib/reportingMetrics");
+const { buildSessionAudioPaths } = require("./lib/accountDeletion");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -1389,6 +1390,59 @@ app.delete("/sessions/:id", requireAuth, async (req, res) => {
     return res.status(500).json({ success: false, error: error.message });
   }
   res.json({ success: true });
+});
+
+// ─── ACCOUNT DELETION ────────────────────────────────────────────────────────
+// Required by App Store Guideline 5.1.1(v): an app that supports account creation
+// must let the user delete the account from inside the app. The frontend button
+// (mindtranceform-app, src/App.jsx handleDeleteAccount) has always called this route.
+//
+// Order matters. Storage objects do NOT cascade, so audio is removed first, while
+// the session rows that name it still exist. `sessions` and `user_profiles` predate
+// the migrations that added ON DELETE CASCADE, so they are cleared explicitly —
+// harmless if a cascade also exists. Everything created by 003/004/creator-access
+// (session_checkins, self_assessments, clinical_assessments, safety_response_events,
+// user_devices) declares ON DELETE CASCADE on auth.users(id) and clears itself when
+// the auth user goes.
+app.delete("/account", requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  console.log(`[account] Deletion requested for user_id=${userId}`);
+
+  try {
+    const { data: sessionRows, error: listErr } = await supabase
+      .from("sessions")
+      .select("id")
+      .eq("user_id", userId);
+    if (listErr) throw new Error(`session lookup failed: ${listErr.message}`);
+
+    const audioPaths = buildSessionAudioPaths(sessionRows);
+    if (audioPaths.length > 0) {
+      const { error: rmErr } = await supabase.storage
+        .from("session-audio")
+        .remove(audioPaths);
+      // Non-fatal: an orphaned object must not block the user's deletion request.
+      if (rmErr) console.error("[account] Storage cleanup failed:", rmErr.message);
+    }
+
+    for (const table of ["sessions", "user_profiles"]) {
+      const { error } = await supabase.from(table).delete().eq("user_id", userId);
+      if (error) throw new Error(`${table} delete failed: ${error.message}`);
+    }
+
+    const { error: authErr } = await supabase.auth.admin.deleteUser(userId);
+    if (authErr) throw new Error(`auth delete failed: ${authErr.message}`);
+
+    console.log(
+      `[account] Deleted user_id=${userId}, ${audioPaths.length} audio file(s) removed`
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("[account] Deletion failed:", err.message);
+    res.status(500).json({
+      success: false,
+      error: "Account deletion failed. Please email support@mindtranceformapp.com.",
+    });
+  }
 });
 
 // ─── TTS HELPERS ─────────────────────────────────────────────────────────────
