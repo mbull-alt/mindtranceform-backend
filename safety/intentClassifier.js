@@ -20,7 +20,7 @@ Where "category" is one of: "safe", "steer", or "block".
 Classification rules:
 - "block": Request involves active suicidal ideation, self-harm instructions, clinical eating disorder treatment, psychosis, substance detox/withdrawal, or requests the session act as therapy or a medical treatment.
 - "steer": Request involves general depression, grief, alcohol reduction, anxiety, sleep issues, low self-worth, relationship pain — reframe toward wellness/relaxation.
-- "safe": General personal development, focus, confidence, sleep preparation, motivation, creativity, stress relief.
+- "safe": General personal development, focus, confidence, sleep preparation, motivation, creativity, stress relief, and physical pain, injury, surgery, or rehab recovery described as a coping/mindset goal (e.g. staying calm with discomfort, patience with healing, confidence returning to activity) rather than a request for treatment, medication guidance, or a diagnosis. Do not steer these into a generic wellness reframe — the app has a dedicated wellness-lane program for this and the specific situation (body part, timeline, fear) should reach the script as given.
 
 Be conservative. When uncertain between steer and block, choose steer. Never generate a refusal that shames the user.
 If category is "steer", populate "steerTo" with an alternative wellness framing. Otherwise "steerTo" is null.`;
