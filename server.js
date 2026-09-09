@@ -380,6 +380,7 @@ function cleanScriptForTTS(script) {
 // ─── FAST-ENTRY PROGRAM INFERENCE ────────────────────────────────────────────
 function inferProgramFromFreeText(text) {
   const t = text.toLowerCase();
+  if (/injur|surgery|surgical|post.?op|recover|rehab|physical therapy|\btear\b|torn|sprain|strain|fracture|\bacl\b|\bmcl\b|\bknee\b|shoulder|\bhip\b|joint pain|chronic pain|back pain|neck pain|in pain|the pain|nerve pain|muscle pain/.test(t)) return "Pain & Recovery";
   if (/sleep|insomnia|can't rest|lie awake|awake at night|tired.*sleep|fall asleep/.test(t)) return "Sleep";
   if (/smok|cigarette|tobacco/.test(t)) return "Quit Smoking";
   if (/weight|overeat|binge.*food|diet|body.*fat|eating habit/.test(t)) return "Weight Loss Mindset";
@@ -1578,6 +1579,7 @@ User: ${name} | Goal: "${goal}" | Program: ${program} | Style: ${style || "Gentl
     "Weight Loss Mindset":  "End with a positive body image and vibrant health visualization.",
     "Relationship Healing": "End with an open heart and readiness for love.",
     "Abundance & Wealth":   "End with a vivid felt sense of financial freedom and certainty.",
+    "Pain & Recovery":      "End with the body settled and at ease, steady and patient with the healing already underway. Never promise pain relief, never reference medication, treatment or diagnosis.",
   };
 
   switch (section) {
@@ -1741,6 +1743,7 @@ function buildPrompt({ name, goal, program, voice, background, style, personaliz
     "Weight Loss Mindset":  "End with a positive body image visualization and the full feeling of living energetically in a healthy body.",
     "Relationship Healing": "End with an open heart, inner peace, and genuine readiness to give and receive love freely.",
     "Abundance & Wealth":   "End with a vivid felt experience of financial freedom and deep certainty that wealth flows naturally to them.",
+    "Pain & Recovery":      "End with the body settled and at ease, the person steady and patient with their own healing, and quietly confident in the work they're doing. Never promise pain relief, never reference medication, treatment or diagnosis.",
   };
   const styleGuides = {
     "Gentle Meditation": "Use a soft, nurturing tone. Keep pacing gentle and reassuring throughout.",
