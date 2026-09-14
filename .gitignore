@@ -1,3 +1,5 @@
 node_modules
 .env
 dist
+supabase/.temp/
+supabase/linked-project.json
