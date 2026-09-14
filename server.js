@@ -527,6 +527,81 @@ function padAudioToTarget(inputBuffer, targetSeconds) {
   });
 }
 
+// ─── SILENT AUDIO BUFFER ─────────────────────────────────────────────────────
+// Generates N seconds of silent MP3 audio via ffmpeg's anullsrc, matching the
+// 44.1kHz/128kbps CBR format ElevenLabs returns (output_format: "mp3_44100_128"),
+// so the buffer concatenates cleanly with real speech chunks before remuxMp3()
+// re-encodes everything into one clean stream.
+function generateSilenceBuffer(seconds) {
+  return new Promise((resolve, reject) => {
+    const tag = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const outputPath = path.join(os.tmpdir(), `mt_silence_${tag}.mp3`);
+    exec(
+      `ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t ${seconds} -c:a libmp3lame -b:a 128k "${outputPath}"`,
+      { timeout: 30000 },
+      (err) => {
+        if (err) {
+          try { fs.unlinkSync(outputPath); } catch {}
+          const e = Object.assign(new Error(`ffmpeg silence generation failed: ${err.message}`), { code: "REMUX_FAILED" });
+          return reject(e);
+        }
+        try {
+          const buf = fs.readFileSync(outputPath);
+          try { fs.unlinkSync(outputPath); } catch {}
+          resolve(buf);
+        } catch (readErr) {
+          const e = Object.assign(new Error(`ffmpeg silence output unreadable: ${readErr.message}`), { code: "REMUX_FAILED" });
+          reject(e);
+        }
+      }
+    );
+  });
+}
+
+// ─── COUNTDOWN → ASSEMBLED SILENCE ───────────────────────────────────────────
+// The deepening countdown ("Ten <break time="7s"/> ... Nine <break time="7s"/> ...")
+// is the densest break-tag cluster in any generated script — measured on a real
+// session, a break every ~2.5 spoken words versus ~7 words/break for the script
+// overall. ElevenLabs documents that dense breaks can speed speech up, and
+// enumerations (which this is) get read faster by the prosody model independent
+// of SSML. extractDeepeningCountdown() pulls this block's ten lines out of the
+// text sent to ElevenLabs entirely; the caller synthesizes each number and each
+// phrase as its own short, break-free request and the pauses are spliced back
+// in as silent audio during assembly. That removes both causes: no breaks reach
+// the model for this block, and no single request contains more than one count.
+//
+// Matches only the exact "COUNTDOWN FORMAT" template from buildPrompt()/SSML_RULES
+// (ten contiguous paragraphs, Ten→One in order, each with a break after the
+// number and a break after the phrase). If the LLM drifts from that template,
+// this returns null and the caller falls back to leaving breaks as SSML — safe,
+// just misses the fix for that one script.
+const COUNTDOWN_NUMBER_WORDS = ["Ten", "Nine", "Eight", "Seven", "Six", "Five", "Four", "Three", "Two", "One"];
+
+function extractDeepeningCountdown(script) {
+  const paragraphs = script.split(/\n\s*\n/);
+  const lineRe = /^\s*(Ten|Nine|Eight|Seven|Six|Five|Four|Three|Two|One)\b\s*<break\s+time="([\d.]+)s"\s*\/>\s*([\s\S]*?)\s*<break\s+time="([\d.]+)s"\s*\/>\s*$/i;
+
+  for (let start = 0; start < paragraphs.length; start++) {
+    if (!/^\s*Ten\b/i.test(paragraphs[start])) continue;
+    const lines = [];
+    let ok = true;
+    for (let j = 0; j < COUNTDOWN_NUMBER_WORDS.length; j++) {
+      const para = paragraphs[start + j];
+      const m = para && para.match(lineRe);
+      if (!m || m[1].toLowerCase() !== COUNTDOWN_NUMBER_WORDS[j].toLowerCase()) { ok = false; break; }
+      lines.push({ number: m[1], pauseAfterNumber: parseFloat(m[2]), phrase: m[3].trim(), pauseAfterPhrase: parseFloat(m[4]) });
+    }
+    if (ok && lines.length === COUNTDOWN_NUMBER_WORDS.length) {
+      return {
+        before: paragraphs.slice(0, start).join("\n\n"),
+        after: paragraphs.slice(start + COUNTDOWN_NUMBER_WORDS.length).join("\n\n"),
+        lines,
+      };
+    }
+  }
+  return null;
+}
+
 // ─── RATE LIMITERS ───────────────────────────────────────────────────────────
 // In-memory store — sufficient for single-instance deployments. Swap for a Redis
 // store (rate-limit-redis) if you go multi-instance.
@@ -604,30 +679,32 @@ app.post("/user/subscribe", requireAuth, async (req, res) => {
 
 app.post("/create-checkout", async (req, res) => {
   const { plan, email } = req.body;
-  // billing is only meaningful for subscription plans (premium/pro) — single is a
-  // one-time purchase with no annual option, so it always resolves to the "single" key
-  // below regardless of what (if anything) the client sends for billing.
+  // Single-session removed 2026-09-10 (code-prompts/pricing-page-annual-wiring-
+  // 2026-09-10.md) — reject explicitly rather than silently falling through, so a
+  // stale client or a bookmarked link fails cleanly instead of creating a charge.
+  // The Stripe Price itself is untouched (Mark archives it in the dashboard
+  // separately) — this only stops new checkout sessions from being created against it.
+  if (plan === "single") {
+    return res.status(400).json({ success: false, error: "Single-session purchases are no longer available. Choose Premium or Pro." });
+  }
   const billing = req.body.billing === "annual" ? "annual" : "monthly";
   const priceMap = {
-    "single":          process.env.STRIPE_PRICE_SINGLE,
     "premium_monthly": process.env.STRIPE_PRICE_PREMIUM,
     "premium_annual":  STRIPE_PRICE_PREMIUM_ANNUAL,
     "pro_monthly":     process.env.STRIPE_PRICE_PRO,
     "pro_annual":      STRIPE_PRICE_PRO_ANNUAL,
   };
-  const priceKey = plan === "single" ? "single" : `${plan}_${billing}`;
-  const priceId = priceMap[priceKey];
+  const priceId = priceMap[`${plan}_${billing}`];
   if (!priceId) return res.status(400).json({ success: false, error: "Invalid plan." });
-  const isSubscription = plan === "premium" || plan === "pro";
   try {
     const session = await stripeClient.checkout.sessions.create({
       payment_method_types: ["card"],
-      mode: isSubscription ? "subscription" : "payment",
+      mode: "subscription",
       customer_email: email || undefined,
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: `${APP_URL}?payment=success&plan=${plan}&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url:  `${APP_URL}?payment=cancelled`,
-      metadata: { plan, email: email || "", ...(isSubscription ? { billing } : {}) },
+      metadata: { plan, email: email || "", billing },
     });
     res.json({ success: true, checkoutUrl: session.url, sessionId: session.id });
   } catch (err) {
@@ -870,6 +947,84 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
         }
       }
     }
+
+    // Ceiling + trim pass: the expansion loop above is one-way (it can only
+    // grow the script), so any overshoot on expansion or awakening-language
+    // regeneration is otherwise permanent.
+    //
+    // The gate is on ESTIMATED TOTAL DURATION (spoken words at pacedWpm, plus
+    // SSML break seconds) — not raw word count. A script that lands exactly on
+    // its word target can still run far over the user's requested length
+    // purely from break time: measured on a real 10-minute/slow session, 911
+    // of 1000 target words (91%, well inside the old word-count ceiling) but
+    // 436s of <break> time pushed total runtime to 983s — 16.4 minutes for a
+    // session the user asked to be 10. Word count alone never catches that,
+    // because break seconds were tracked for logging only and never fed back
+    // into the ceiling check.
+    const DURATION_OVERSHOOT_CEILING = 1.10;
+    const targetSeconds = mins * 60;
+    const measureTotalSeconds = (script) => {
+      const normalized = script.replace(/<break\s+time=["']?([\d.]+)s["']?\s*\/?>/gi, '<break time="$1s"/>');
+      const breakSeconds = [...normalized.matchAll(/<break\s+time="([\d.]+)s"\s*\/>/g)]
+        .reduce((sum, m) => sum + parseFloat(m[1]), 0);
+      return (countSpokenWords(normalized) / pacedWpm) * 60 + breakSeconds;
+    };
+    let estimatedSeconds = measureTotalSeconds(rawScript);
+    console.log(`[generate] Estimated total duration: ${Math.round(estimatedSeconds)}s vs target ${targetSeconds}s (${Math.round(100 * estimatedSeconds / targetSeconds)}%)`);
+    // Bounded retry, same 2-attempt budget as the expansion loop above. A
+    // single pass under-corrects in practice: the LLM doesn't shrink break
+    // time in proportion to word count even when told to keep breaks
+    // "proportional" — measured on a real over-target script, one trim pass
+    // took 983s/600s (164%) to 708s (118%), a second pass took it to 667s
+    // (111%). Each pass re-measures actual break seconds from the real
+    // output and recomputes the ratio, so this converges on what the script
+    // actually did rather than compounding one guess.
+    const MAX_DURATION_TRIM_ATTEMPTS = 2;
+    for (let trimAttempt = 0; trimAttempt < MAX_DURATION_TRIM_ATTEMPTS && estimatedSeconds > targetSeconds * DURATION_OVERSHOOT_CEILING; trimAttempt++) {
+      // Scale word count down by the same ratio the estimated total duration
+      // exceeds target — not "subtract the excess seconds converted to
+      // words," which implicitly assumes break time stays fixed while only
+      // speech time shrinks. It doesn't: break tags are roughly proportional
+      // to sentence count, so cutting words cuts break time too. Scaling both
+      // together keeps the correction self-consistent instead of overshooting
+      // the trim (verified against a real over-target script: the fixed-break
+      // version of this formula would have cut 911 words to 273 — a 70% cut —
+      // where the proportional version below asks for ~556, a 39% cut, which
+      // is closer to what actually lands on target once its breaks shrink
+      // with it).
+      const overshootSeconds = estimatedSeconds - targetSeconds;
+      const wordBudget = Math.max(50, Math.round(currentWordCount * (targetSeconds / estimatedSeconds)));
+      console.log(`[generate] Duration trim attempt ${trimAttempt + 1}/${MAX_DURATION_TRIM_ATTEMPTS}: over target by ${Math.round(overshootSeconds)}s (${Math.round(estimatedSeconds)}/${targetSeconds}s) — requesting a version trimmed to ~${wordBudget} spoken words`);
+      const trimPrompt = `The following meditation/hypnosis script has ${currentWordCount} spoken words but needs to be reduced to approximately ${wordBudget} spoken words so the finished audio (spoken words plus its SSML pause tags) lands close to the requested ${mins}-minute length (SSML tags like <break time="3s"/> do not count as words). Return a shortened version at approximately ${wordBudget} spoken words. Preserve the induction, deepening, core therapeutic content, and emergence — tighten phrasing and reduce repetition rather than cutting whole sections. Keep the existing SSML break tags proportionally, in the same style. Do not add titles, labels, or commentary — output only the shortened script.\n\nScript to shorten:\n${rawScript}`;
+      const trimResponse = await axios.post(
+        "https://api.openai.com/v1/chat/completions",
+        { model: "gpt-4o-mini", messages: [{ role: "user", content: trimPrompt }], max_tokens: maxTokens, temperature: 0.85 },
+        { headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" } }
+      );
+      const trimmed = trimResponse.data.choices[0]?.message?.content?.trim();
+      if (!trimmed) break;
+      const trimmedWordCount = countSpokenWords(trimmed);
+      const trimmedSeconds = measureTotalSeconds(trimmed);
+      // Only accept the trim if it actually reduced estimated duration
+      // without falling well below the new (break-aware) word budget — an
+      // LLM asked to shorten can ignore the instruction, overcorrect, or add
+      // breaks back in while cutting words. The floor is relative to
+      // wordBudget, not the original wordTarget: wordBudget is deliberately
+      // much lower than wordTarget once break time is priced in, so
+      // wordTarget is the wrong yardstick here (see comment above).
+      if (trimmedSeconds < estimatedSeconds && trimmedWordCount >= wordBudget * 0.85) {
+        rawScript = trimmed;
+        currentWordCount = trimmedWordCount;
+        estimatedSeconds = trimmedSeconds;
+        console.log(`[generate] After trim attempt ${trimAttempt + 1}: ${currentWordCount} spoken words, estimated duration ${Math.round(estimatedSeconds)}s (${Math.round(100 * estimatedSeconds / targetSeconds)}% of target)`);
+      } else {
+        console.warn(`[generate] Trim attempt ${trimAttempt + 1} rejected (before=${Math.round(estimatedSeconds)}s after=${Math.round(trimmedSeconds)}s, words after=${trimmedWordCount}, target=${wordTarget}) — keeping previous script, stopping retries`);
+        break;
+      }
+    }
+    if (estimatedSeconds > targetSeconds * DURATION_OVERSHOOT_CEILING) {
+      console.warn(`[generate] Still over target after ${MAX_DURATION_TRIM_ATTEMPTS} duration trim attempt(s): ${Math.round(estimatedSeconds)}s/${targetSeconds}s (${Math.round(100 * estimatedSeconds / targetSeconds)}%) — proceeding anyway`);
+    }
     } // end else (single-call path)
 
     // Normalize malformed SSML break tags from LLM output before TTS.
@@ -909,31 +1064,73 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
     // ── Diagnostic: state of script entering TTS pipeline ────────────────────
     console.log(`[PRE-CHUNK] char_count=${ssmlScript.length} stripped_word_count=${preTTSWordCount}`);
 
-    const ttsChunks = splitIntoTTSChunks(ssmlScript, ELEVENLABS_CHUNK_LIMIT);
+    // Pull the deepening countdown (if the script followed the template) out of
+    // the SSML text entirely — its lines are synthesized separately below with
+    // no break tags, and their pauses are spliced in as assembled silence.
+    const countdown = extractDeepeningCountdown(ssmlScript);
+    if (countdown) {
+      console.log(`[countdown] Detected deepening countdown (Ten→One) — synthesizing its ${countdown.lines.length} lines separately with assembled silence instead of SSML breaks.`);
+    } else if (/\bTen\b[^\n]{0,60}<break/i.test(ssmlScript)) {
+      console.warn(`[countdown] Script contains what looks like a countdown but it didn't match the expected Ten→One template exactly — leaving its break tags as SSML (no assembled-silence split).`);
+    }
+
+    const beforeText = countdown ? countdown.before : ssmlScript;
+    const afterText = countdown ? countdown.after : "";
+    const beforeChunks = splitIntoTTSChunks(beforeText, ELEVENLABS_CHUNK_LIMIT);
+    const afterChunks = afterText ? splitIntoTTSChunks(afterText, ELEVENLABS_CHUNK_LIMIT) : [];
+    // Kept only as a combined count/log for the diagnostics below — synthesis
+    // walks beforeChunks / countdown.lines / afterChunks separately.
+    const ttsChunks = [...beforeChunks, ...afterChunks];
     const modelId = "eleven_multilingual_v2";
     const voiceSettings = { stability: deliveryStability, similarity_boost: 0.80, style: 0.20, use_speaker_boost: true, speed: pacedSpeed };
     console.log(`[generate] pace=${normalizedPace} speed=${pacedSpeed} wpm=${pacedWpm} wordTarget=${wordTarget} delivery=${normalizedDelivery} stability=${deliveryStability}`);
 
     // ── SCRIPT STATS — ground truth before TTS ────────────────────────────────
+    // Computed against the full ssmlScript (countdown breaks included) — moving
+    // the countdown's pauses from SSML to assembled silence relocates that
+    // silence, it doesn't remove it, so the total-duration estimate is unchanged.
     const scriptBreakMatches = [...ssmlScript.matchAll(/<break\s+time="([\d.]+)s"\s*\/>/g)];
     const estimatedBreakSeconds = scriptBreakMatches.reduce((sum, m) => sum + parseFloat(m[1]), 0);
     const estimatedTotalDuration = Math.round((preTTSWordCount / pacedWpm) * 60 + estimatedBreakSeconds);
     console.log(`[SCRIPT STATS] target_minutes=${mins} word_target=${wordTarget} stripped_word_count=${preTTSWordCount}`);
     console.log(`[SCRIPT STATS] break_count=${scriptBreakMatches.length} estimated_break_seconds=${Math.round(estimatedBreakSeconds)} estimated_total_duration_seconds=${estimatedTotalDuration}`);
-    console.log(`[AUDIO STATS] Chunks: ${ttsChunks.length}, sizes: [${ttsChunks.map(c => c.length).join(", ")}], model: ${modelId}`);
+    console.log(`[AUDIO STATS] Chunks: ${ttsChunks.length} (${beforeChunks.length} before countdown + ${afterChunks.length} after${countdown ? `, ${countdown.lines.length} countdown lines synthesized separately` : ""}), sizes: [${ttsChunks.map(c => c.length).join(", ")}], model: ${modelId}`);
 
     try {
       const audioBuffers = [];
-      for (let i = 0; i < ttsChunks.length; i++) {
+      for (let i = 0; i < beforeChunks.length; i++) {
         // Prepend a silent break to chunk 0 so the model initialises before speaking.
-        const chunkText = i === 0 ? '<break time="2s"/> ' + ttsChunks[i] : ttsChunks[i];
-        console.log(`[CHUNK ${i + 1}/${ttsChunks.length}] char_count=${chunkText.length} first_80_chars="${chunkText.slice(0, 80).replace(/\n/g, "\\n")}"`);
+        const chunkText = i === 0 ? '<break time="2s"/> ' + beforeChunks[i] : beforeChunks[i];
+        console.log(`[CHUNK ${i + 1}/${beforeChunks.length}${countdown || afterChunks.length ? " before countdown" : ""}] char_count=${chunkText.length} first_80_chars="${chunkText.slice(0, 80).replace(/\n/g, "\\n")}"`);
         emit({ stage: "synthesizing", chunk: i + 1, totalChunks: ttsChunks.length, message: `Generating voice, ${i + 1} of ${ttsChunks.length}...` });
         const chunkBuf = await synthesizeChunkWithRetry(voiceId, chunkText, modelId, voiceSettings);
         audioBuffers.push(chunkBuf);
         const chunkEstSecs = Math.round(chunkBuf.length / 16000);
         console.log(`[CHUNK ${i + 1} DONE] byte_count=${chunkBuf.length} estimated_seconds=${chunkEstSecs}`);
       }
+
+      if (countdown) {
+        emit({ stage: "synthesizing", message: "Generating countdown..." });
+        for (const line of countdown.lines) {
+          const numberBuf = await synthesizeChunkWithRetry(voiceId, `${line.number}.`, modelId, voiceSettings);
+          audioBuffers.push(numberBuf);
+          audioBuffers.push(await generateSilenceBuffer(line.pauseAfterNumber));
+          const phraseBuf = await synthesizeChunkWithRetry(voiceId, `${line.phrase}.`, modelId, voiceSettings);
+          audioBuffers.push(phraseBuf);
+          audioBuffers.push(await generateSilenceBuffer(line.pauseAfterPhrase));
+          console.log(`[countdown] "${line.number}" synthesized separately (no break tags) — ${line.pauseAfterNumber}s + ${line.pauseAfterPhrase}s spliced in as assembled silence`);
+        }
+      }
+
+      for (let i = 0; i < afterChunks.length; i++) {
+        console.log(`[CHUNK ${i + 1}/${afterChunks.length} after countdown] char_count=${afterChunks[i].length} first_80_chars="${afterChunks[i].slice(0, 80).replace(/\n/g, "\\n")}"`);
+        emit({ stage: "synthesizing", chunk: beforeChunks.length + i + 1, totalChunks: ttsChunks.length, message: `Generating voice, ${beforeChunks.length + i + 1} of ${ttsChunks.length}...` });
+        const chunkBuf = await synthesizeChunkWithRetry(voiceId, afterChunks[i], modelId, voiceSettings);
+        audioBuffers.push(chunkBuf);
+        const chunkEstSecs = Math.round(chunkBuf.length / 16000);
+        console.log(`[CHUNK after-${i + 1} DONE] byte_count=${chunkBuf.length} estimated_seconds=${chunkEstSecs}`);
+      }
+
       const rawConcatenated = Buffer.concat(audioBuffers);
       console.log(`[AUDIO STATS] Audio bytes per chunk: [${audioBuffers.map(b => b.length).join(", ")}]`);
       console.log(`[AUDIO STATS] Total raw concat bytes: ${rawConcatenated.length}`);
@@ -2061,7 +2258,6 @@ app.post("/webhook/stripe", async (req, res) => {
         // update on every subscription.updated event (renewal, tier change, etc.) since
         // this map previously only recognized the three monthly price IDs.
         const priceMap = {
-          [process.env.STRIPE_PRICE_SINGLE]:  "single",
           [process.env.STRIPE_PRICE_PREMIUM]: "premium",
           [process.env.STRIPE_PRICE_PRO]:     "pro",
           [STRIPE_PRICE_PREMIUM_ANNUAL]:      "premium",
