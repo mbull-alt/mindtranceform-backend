@@ -558,49 +558,6 @@ function generateSilenceBuffer(seconds) {
   });
 }
 
-// ─── COUNTDOWN → ASSEMBLED SILENCE ───────────────────────────────────────────
-// The deepening countdown ("Ten <break time="7s"/> ... Nine <break time="7s"/> ...")
-// is the densest break-tag cluster in any generated script — measured on a real
-// session, a break every ~2.5 spoken words versus ~7 words/break for the script
-// overall. ElevenLabs documents that dense breaks can speed speech up, and
-// enumerations (which this is) get read faster by the prosody model independent
-// of SSML. extractDeepeningCountdown() pulls this block's ten lines out of the
-// text sent to ElevenLabs entirely; the caller synthesizes each number and each
-// phrase as its own short, break-free request and the pauses are spliced back
-// in as silent audio during assembly. That removes both causes: no breaks reach
-// the model for this block, and no single request contains more than one count.
-//
-// Matches only the exact "COUNTDOWN FORMAT" template from buildPrompt()/SSML_RULES
-// (ten contiguous paragraphs, Ten→One in order, each with a break after the
-// number and a break after the phrase). If the LLM drifts from that template,
-// this returns null and the caller falls back to leaving breaks as SSML — safe,
-// just misses the fix for that one script.
-const COUNTDOWN_NUMBER_WORDS = ["Ten", "Nine", "Eight", "Seven", "Six", "Five", "Four", "Three", "Two", "One"];
-
-function extractDeepeningCountdown(script) {
-  const paragraphs = script.split(/\n\s*\n/);
-  const lineRe = /^\s*(Ten|Nine|Eight|Seven|Six|Five|Four|Three|Two|One)\b\s*<break\s+time="([\d.]+)s"\s*\/>\s*([\s\S]*?)\s*<break\s+time="([\d.]+)s"\s*\/>\s*$/i;
-
-  for (let start = 0; start < paragraphs.length; start++) {
-    if (!/^\s*Ten\b/i.test(paragraphs[start])) continue;
-    const lines = [];
-    let ok = true;
-    for (let j = 0; j < COUNTDOWN_NUMBER_WORDS.length; j++) {
-      const para = paragraphs[start + j];
-      const m = para && para.match(lineRe);
-      if (!m || m[1].toLowerCase() !== COUNTDOWN_NUMBER_WORDS[j].toLowerCase()) { ok = false; break; }
-      lines.push({ number: m[1], pauseAfterNumber: parseFloat(m[2]), phrase: m[3].trim(), pauseAfterPhrase: parseFloat(m[4]) });
-    }
-    if (ok && lines.length === COUNTDOWN_NUMBER_WORDS.length) {
-      return {
-        before: paragraphs.slice(0, start).join("\n\n"),
-        after: paragraphs.slice(start + COUNTDOWN_NUMBER_WORDS.length).join("\n\n"),
-        lines,
-      };
-    }
-  }
-  return null;
-}
 
 // ─── RATE LIMITERS ───────────────────────────────────────────────────────────
 // In-memory store — sufficient for single-instance deployments. Swap for a Redis
@@ -808,9 +765,6 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
   if (parseInt(length) > 60) {
     console.warn(`[generate] Requested ${length} min — capped at 60`);
   }
-  // Per-chunk limit sent to ElevenLabs. Script is always split into chunks regardless of
-  // total length — each chunk is synthesised separately then concatenated in order.
-  const ELEVENLABS_CHUNK_LIMIT = 1500;
   const WPM_BY_PACE  = { slow: 100, medium: 110, fast: 120 };
   const SPEED_BY_PACE = { slow: 0.75, medium: 0.82, fast: 0.90 };
   const normalizedPace = (pace || "slow").toLowerCase();
@@ -849,9 +803,16 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
 
     if (process.env.USE_SECTION_GENERATION === "true") {
       emit({ stage: "script_generating", message: "Writing your session..." });
-      rawScript = await generateSessionSections({ name, goal: resolvedGoal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, wordTarget, maxTokens });
+      rawScript = await generateSessionSections({ name, goal: resolvedGoal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, wordTarget, maxTokens, mins, pacedWpm });
       currentWordCount = countSpokenWords(rawScript);
       console.log(`[generate] Section-generated spoken words: ${currentWordCount}, Target: ${wordTarget}`);
+      // No per-path trim-for-duration here anymore — content is generated
+      // once from the item-count floors/ceilings in generateSessionSections()
+      // and accepted as-is. Duration is reconciled by weighted silence
+      // distribution in the shared pacing step below, not by re-asking the
+      // LLM to hit a word count. The shared last-resort trim (below, after
+      // this if/else) is the only remaining trim path, and fires only on a
+      // genuine floor-level failure.
     } else {
       const prompt = buildPrompt({ name, goal: resolvedGoal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, backgroundIntensity, wordTarget, mins });
       emit({ stage: "script_generating", message: "Writing your session..." });
@@ -963,13 +924,7 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
     // into the ceiling check.
     const DURATION_OVERSHOOT_CEILING = 1.10;
     const targetSeconds = mins * 60;
-    const measureTotalSeconds = (script) => {
-      const normalized = script.replace(/<break\s+time=["']?([\d.]+)s["']?\s*\/?>/gi, '<break time="$1s"/>');
-      const breakSeconds = [...normalized.matchAll(/<break\s+time="([\d.]+)s"\s*\/>/g)]
-        .reduce((sum, m) => sum + parseFloat(m[1]), 0);
-      return (countSpokenWords(normalized) / pacedWpm) * 60 + breakSeconds;
-    };
-    let estimatedSeconds = measureTotalSeconds(rawScript);
+    let estimatedSeconds = measureTotalSeconds(rawScript, pacedWpm);
     console.log(`[generate] Estimated total duration: ${Math.round(estimatedSeconds)}s vs target ${targetSeconds}s (${Math.round(100 * estimatedSeconds / targetSeconds)}%)`);
     // Bounded retry, same 2-attempt budget as the expansion loop above. A
     // single pass under-corrects in practice: the LLM doesn't shrink break
@@ -1004,7 +959,7 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
       const trimmed = trimResponse.data.choices[0]?.message?.content?.trim();
       if (!trimmed) break;
       const trimmedWordCount = countSpokenWords(trimmed);
-      const trimmedSeconds = measureTotalSeconds(trimmed);
+      const trimmedSeconds = measureTotalSeconds(trimmed, pacedWpm);
       // Only accept the trim if it actually reduced estimated duration
       // without falling well below the new (break-aware) word budget — an
       // LLM asked to shorten can ignore the instruction, overcorrect, or add
@@ -1037,21 +992,11 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
       console.log(`[SSML FIX] normalized break tags: ${breaksAfter} valid out of ${breaksBefore} found`);
     }
 
-    // ssmlScript — retains <break> tags for ElevenLabs audio generation
-    const ssmlScript = cleanScriptForTTS(rawScript);
-    const preTTSWordCount = countSpokenWords(ssmlScript);
+    // ssmlScript — retains <break> tags for ElevenLabs audio generation.
+    // let, not const: the last-resort pacing trim below can replace it.
+    let ssmlScript = cleanScriptForTTS(rawScript);
+    let preTTSWordCount = countSpokenWords(ssmlScript);
     console.log(`[generate] Pre-TTS stripped word count: ${preTTSWordCount} words (target: ${wordTarget}, ${Math.round(preTTSWordCount / wordTarget * 100)}% of target)`);
-
-    // cleanScript — all XML/SSML tags stripped; used for display, storage, email.
-    // IMPORTANT: convert <break> tags to newlines FIRST so pause points become
-    // paragraph breaks in the displayed text instead of collapsing into one long paragraph.
-    const cleanScript = ssmlScript
-      .replace(/<break[^>]*\/>/g, "\n\n")  // convert SSML break tags → paragraph breaks
-      .replace(/<[^>]*>/g, "")             // strip any remaining XML/SSML tags
-      .replace(/[ \t]{2,}/g, " ")          // collapse horizontal whitespace only
-      .replace(/\n[ \t]+/g, "\n")          // remove leading spaces on new lines
-      .replace(/\n{3,}/g, "\n\n")          // normalise to at most double newlines
-      .trim();
 
     console.log(`wordTarget: ${wordTarget}`);
 
@@ -1064,75 +1009,111 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
     // ── Diagnostic: state of script entering TTS pipeline ────────────────────
     console.log(`[PRE-CHUNK] char_count=${ssmlScript.length} stripped_word_count=${preTTSWordCount}`);
 
-    // Pull the deepening countdown (if the script followed the template) out of
-    // the SSML text entirely — its lines are synthesized separately below with
-    // no break tags, and their pauses are spliced in as assembled silence.
-    const countdown = extractDeepeningCountdown(ssmlScript);
-    if (countdown) {
-      console.log(`[countdown] Detected deepening countdown (Ten→One) — synthesizing its ${countdown.lines.length} lines separately with assembled silence instead of SSML breaks.`);
-    } else if (/\bTen\b[^\n]{0,60}<break/i.test(ssmlScript)) {
-      console.warn(`[countdown] Script contains what looks like a countdown but it didn't match the expected Ten→One template exactly — leaving its break tags as SSML (no assembled-silence split).`);
-    }
-
-    const beforeText = countdown ? countdown.before : ssmlScript;
-    const afterText = countdown ? countdown.after : "";
-    const beforeChunks = splitIntoTTSChunks(beforeText, ELEVENLABS_CHUNK_LIMIT);
-    const afterChunks = afterText ? splitIntoTTSChunks(afterText, ELEVENLABS_CHUNK_LIMIT) : [];
-    // Kept only as a combined count/log for the diagnostics below — synthesis
-    // walks beforeChunks / countdown.lines / afterChunks separately.
-    const ttsChunks = [...beforeChunks, ...afterChunks];
     const modelId = "eleven_multilingual_v2";
     const voiceSettings = { stability: deliveryStability, similarity_boost: 0.80, style: 0.20, use_speaker_boost: true, speed: pacedSpeed };
     console.log(`[generate] pace=${normalizedPace} speed=${pacedSpeed} wpm=${pacedWpm} wordTarget=${wordTarget} delivery=${normalizedDelivery} stability=${deliveryStability}`);
 
-    // ── SCRIPT STATS — ground truth before TTS ────────────────────────────────
-    // Computed against the full ssmlScript (countdown breaks included) — moving
-    // the countdown's pauses from SSML to assembled silence relocates that
-    // silence, it doesn't remove it, so the total-duration estimate is unchanged.
-    const scriptBreakMatches = [...ssmlScript.matchAll(/<break\s+time="([\d.]+)s"\s*\/>/g)];
-    const estimatedBreakSeconds = scriptBreakMatches.reduce((sum, m) => sum + parseFloat(m[1]), 0);
-    const estimatedTotalDuration = Math.round((preTTSWordCount / pacedWpm) * 60 + estimatedBreakSeconds);
+    // Every <break> becomes a position marker only. Its own authored duration
+    // is discarded; real silence is assembled afterward at whatever duration
+    // this session actually needs. See PAUSE_WEIGHTS for classification.
+    let pauseSegments = splitIntoPausePoints(ssmlScript);
+    const pacingTargetSeconds = mins * 60;
+    const PAUSE_DURATION_OVERSHOOT_CEILING = 1.10;
+
+    // Last-resort content trim: fires only if even the minimum-possible pause
+    // length (PAUSE_MIN_SECONDS at every point) still overshoots target by
+    // more than the tolerance. Not the primary mechanism — the item-count
+    // floors upstream (inductionCounts/therapeuticCounts/etc.) are what's
+    // supposed to keep this rare. One bounded attempt, same shape as the
+    // single-call path's own trim.
+    {
+      const pausePointCountPreTrim = pauseSegments.filter(s => s.pauseType).length;
+      const spokenSecondsPreTrim = (preTTSWordCount / pacedWpm) * 60;
+      const minPossibleTotal = spokenSecondsPreTrim + pausePointCountPreTrim * PAUSE_MIN_SECONDS;
+      if (minPossibleTotal > pacingTargetSeconds * PAUSE_DURATION_OVERSHOOT_CEILING) {
+        const wordBudget = Math.max(50, Math.round(preTTSWordCount * (pacingTargetSeconds / minPossibleTotal)));
+        console.log(`[pacing] Last-resort trim: minimum-possible duration ${Math.round(minPossibleTotal)}s (spoken ${Math.round(spokenSecondsPreTrim)}s + ${pausePointCountPreTrim} pauses at the ${PAUSE_MIN_SECONDS}s floor) exceeds target ${pacingTargetSeconds}s — requesting a version trimmed to ~${wordBudget} spoken words`);
+        try {
+          const trimPrompt = `The following meditation/hypnosis script has ${preTTSWordCount} spoken words but needs to be reduced to approximately ${wordBudget} spoken words so the finished audio lands close to the requested ${mins}-minute length (SSML tags do not count as words). Return a shortened version at approximately ${wordBudget} spoken words. Preserve the induction, deepening, core therapeutic content, and emergence — tighten phrasing and reduce repetition rather than cutting whole sections. Keep the existing SSML break tags proportionally, in the same style. Do not add titles, labels, or commentary — output only the shortened script.\n\nScript to shorten:\n${ssmlScript}`;
+          const trimResponse = await axios.post(
+            "https://api.openai.com/v1/chat/completions",
+            { model: "gpt-4o-mini", messages: [{ role: "user", content: trimPrompt }], max_tokens: maxTokens, temperature: 0.85 },
+            { headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" } }
+          );
+          const trimmed = trimResponse.data.choices[0]?.message?.content?.trim();
+          if (trimmed) {
+            const trimmedClean = cleanScriptForTTS(trimmed.replace(/<break\s+time=["']?([\d.]+)s["']?\s*\/?>/gi, '<break time="$1s"/>'));
+            const trimmedWordCount = countSpokenWords(trimmedClean);
+            const trimmedSegments = splitIntoPausePoints(trimmedClean);
+            const trimmedPausePoints = trimmedSegments.filter(s => s.pauseType).length;
+            const trimmedMinPossible = (trimmedWordCount / pacedWpm) * 60 + trimmedPausePoints * PAUSE_MIN_SECONDS;
+            if (trimmedMinPossible < minPossibleTotal && trimmedWordCount >= wordBudget * 0.85) {
+              ssmlScript = trimmedClean;
+              preTTSWordCount = trimmedWordCount;
+              pauseSegments = trimmedSegments;
+              console.log(`[pacing] After last-resort trim: ${trimmedWordCount} spoken words, minimum-possible duration ${Math.round(trimmedMinPossible)}s`);
+            } else {
+              console.warn(`[pacing] Last-resort trim rejected (before=${Math.round(minPossibleTotal)}s after=${Math.round(trimmedMinPossible)}s) — keeping untrimmed script; pauses will clamp to the floor and target will still be missed`);
+            }
+          }
+        } catch (trimErr) {
+          console.warn(`[pacing] Last-resort trim request failed: ${trimErr.message} — keeping untrimmed script`);
+        }
+      }
+    }
+
+    // cleanScript — all XML/SSML tags stripped; used for display, storage,
+    // email. Computed here, after the last-resort trim above has had its
+    // chance to replace ssmlScript — building it earlier would let a trim
+    // silently desync the stored/emailed text from the audio actually
+    // generated from the trimmed script.
+    // IMPORTANT: convert <break> tags to newlines FIRST so pause points become
+    // paragraph breaks in the displayed text instead of collapsing into one long paragraph.
+    const cleanScript = ssmlScript
+      .replace(/<break[^>]*\/>/g, "\n\n")  // convert SSML break tags → paragraph breaks
+      .replace(/<[^>]*>/g, "")             // strip any remaining XML/SSML tags
+      .replace(/[ \t]{2,}/g, " ")          // collapse horizontal whitespace only
+      .replace(/\n[ \t]+/g, "\n")          // remove leading spaces on new lines
+      .replace(/\n{3,}/g, "\n\n")          // normalise to at most double newlines
+      .trim();
+
+    const spokenSeconds = (preTTSWordCount / pacedWpm) * 60;
+    const remainingSeconds = pacingTargetSeconds - spokenSeconds;
+    const pauseDurations = computePauseDurations(pauseSegments, remainingSeconds);
+    const pausePointCount = pauseSegments.filter(s => s.pauseType).length;
+    const totalPauseSeconds = pauseDurations.reduce((sum, d) => sum + (d || 0), 0);
+    const estimatedTotalDuration = Math.round(spokenSeconds + totalPauseSeconds);
+    const pauseTypeCounts = pauseSegments.reduce((acc, s) => { if (s.pauseType) acc[s.pauseType] = (acc[s.pauseType] || 0) + 1; return acc; }, {});
     console.log(`[SCRIPT STATS] target_minutes=${mins} word_target=${wordTarget} stripped_word_count=${preTTSWordCount}`);
-    console.log(`[SCRIPT STATS] break_count=${scriptBreakMatches.length} estimated_break_seconds=${Math.round(estimatedBreakSeconds)} estimated_total_duration_seconds=${estimatedTotalDuration}`);
-    console.log(`[AUDIO STATS] Chunks: ${ttsChunks.length} (${beforeChunks.length} before countdown + ${afterChunks.length} after${countdown ? `, ${countdown.lines.length} countdown lines synthesized separately` : ""}), sizes: [${ttsChunks.map(c => c.length).join(", ")}], model: ${modelId}`);
+    console.log(`[SCRIPT STATS] pause_points=${pausePointCount} pause_types=${JSON.stringify(pauseTypeCounts)} spoken_seconds=${Math.round(spokenSeconds)} pause_seconds=${Math.round(totalPauseSeconds)} estimated_total_duration_seconds=${estimatedTotalDuration}`);
+    console.log(`[AUDIO STATS] Segments: ${pauseSegments.length}, model: ${modelId}`);
+
+    // Set on success (probed real duration if ffprobe is available, else the
+    // byte-count estimate); stays null if generation fails entirely, so the
+    // unconditional [duration] line after the try/catch below can still log
+    // "final=unknown" instead of silently not firing.
+    let finalSeconds = null;
 
     try {
       const audioBuffers = [];
-      for (let i = 0; i < beforeChunks.length; i++) {
-        // Prepend a silent break to chunk 0 so the model initialises before speaking.
-        const chunkText = i === 0 ? '<break time="2s"/> ' + beforeChunks[i] : beforeChunks[i];
-        console.log(`[CHUNK ${i + 1}/${beforeChunks.length}${countdown || afterChunks.length ? " before countdown" : ""}] char_count=${chunkText.length} first_80_chars="${chunkText.slice(0, 80).replace(/\n/g, "\\n")}"`);
-        emit({ stage: "synthesizing", chunk: i + 1, totalChunks: ttsChunks.length, message: `Generating voice, ${i + 1} of ${ttsChunks.length}...` });
-        const chunkBuf = await synthesizeChunkWithRetry(voiceId, chunkText, modelId, voiceSettings);
-        audioBuffers.push(chunkBuf);
-        const chunkEstSecs = Math.round(chunkBuf.length / 16000);
-        console.log(`[CHUNK ${i + 1} DONE] byte_count=${chunkBuf.length} estimated_seconds=${chunkEstSecs}`);
-      }
-
-      if (countdown) {
-        emit({ stage: "synthesizing", message: "Generating countdown..." });
-        for (const line of countdown.lines) {
-          const numberBuf = await synthesizeChunkWithRetry(voiceId, `${line.number}.`, modelId, voiceSettings);
-          audioBuffers.push(numberBuf);
-          audioBuffers.push(await generateSilenceBuffer(line.pauseAfterNumber));
-          const phraseBuf = await synthesizeChunkWithRetry(voiceId, `${line.phrase}.`, modelId, voiceSettings);
-          audioBuffers.push(phraseBuf);
-          audioBuffers.push(await generateSilenceBuffer(line.pauseAfterPhrase));
-          console.log(`[countdown] "${line.number}" synthesized separately (no break tags) — ${line.pauseAfterNumber}s + ${line.pauseAfterPhrase}s spliced in as assembled silence`);
+      // Fixed priming silence before the first spoken word so the model
+      // initialises before speaking — same role the old leading <break
+      // time="2s"/> played, just carried as assembled silence now that every
+      // pause is.
+      audioBuffers.push(await generateSilenceBuffer(2.0));
+      for (let i = 0; i < pauseSegments.length; i++) {
+        const seg = pauseSegments[i];
+        console.log(`[SEGMENT ${i + 1}/${pauseSegments.length}${seg.pauseType ? ` pause=${seg.pauseType}(${pauseDurations[i].toFixed(1)}s)` : ""}] char_count=${seg.text.length} first_80_chars="${seg.text.slice(0, 80).replace(/\n/g, "\\n")}"`);
+        emit({ stage: "synthesizing", chunk: i + 1, totalChunks: pauseSegments.length, message: `Generating voice, ${i + 1} of ${pauseSegments.length}...` });
+        const segBuf = await synthesizeChunkWithRetry(voiceId, seg.text, modelId, voiceSettings);
+        audioBuffers.push(segBuf);
+        if (seg.pauseType) {
+          audioBuffers.push(await generateSilenceBuffer(pauseDurations[i]));
         }
       }
 
-      for (let i = 0; i < afterChunks.length; i++) {
-        console.log(`[CHUNK ${i + 1}/${afterChunks.length} after countdown] char_count=${afterChunks[i].length} first_80_chars="${afterChunks[i].slice(0, 80).replace(/\n/g, "\\n")}"`);
-        emit({ stage: "synthesizing", chunk: beforeChunks.length + i + 1, totalChunks: ttsChunks.length, message: `Generating voice, ${beforeChunks.length + i + 1} of ${ttsChunks.length}...` });
-        const chunkBuf = await synthesizeChunkWithRetry(voiceId, afterChunks[i], modelId, voiceSettings);
-        audioBuffers.push(chunkBuf);
-        const chunkEstSecs = Math.round(chunkBuf.length / 16000);
-        console.log(`[CHUNK after-${i + 1} DONE] byte_count=${chunkBuf.length} estimated_seconds=${chunkEstSecs}`);
-      }
-
       const rawConcatenated = Buffer.concat(audioBuffers);
-      console.log(`[AUDIO STATS] Audio bytes per chunk: [${audioBuffers.map(b => b.length).join(", ")}]`);
+      console.log(`[AUDIO STATS] Audio bytes per segment: [${audioBuffers.map(b => b.length).join(", ")}]`);
       console.log(`[AUDIO STATS] Total raw concat bytes: ${rawConcatenated.length}`);
 
       // Re-mux concatenated chunks into a single clean CBR MP3 with a proper
@@ -1143,8 +1124,17 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
       audioBase64 = finalAudio.toString("base64");
 
       // ── Post-TTS duration assertion ────────────────────────────────────────
+      // This is a REMUX INTEGRITY check — does the finished file's probed
+      // duration match what its own byte count predicts? It catches a corrupt
+      // re-mux. It says nothing about whether the session is the length the
+      // user asked for, and comparing "duration" to "expected" here (both
+      // derived from the same finished file) reads like a success indicator
+      // even when the file is the wrong length entirely — see the
+      // unconditional [duration] line below, which is the actual answer to
+      // "did we deliver what was requested."
       const byteEstimatedSecs = Math.round(finalAudio.length / 16000);
       const probedSecs = await probeDuration(finalAudio);
+      finalSeconds = probedSecs !== null ? probedSecs : byteEstimatedSecs;
       if (probedSecs !== null) {
         const delta = Math.abs(probedSecs - byteEstimatedSecs);
         const probedMins = Math.floor(probedSecs / 60);
@@ -1160,7 +1150,7 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
         const estSecPart = byteEstimatedSecs % 60;
         console.log(`[FINAL AUDIO] ffprobe unavailable — byte-estimate: ${byteEstimatedSecs}s (${estMins}:${String(estSecPart).padStart(2, "0")})`);
       }
-      console.log(`[elevenlabs] All ${ttsChunks.length} chunk(s) synthesised`);
+      console.log(`[elevenlabs] All ${pauseSegments.length} segment(s) synthesised`);
     } catch (audioErr) {
       if (audioErr.code === "REMUX_FAILED") {
         console.error(`[remux] Fatal remux error — propagating to outer catch:`, audioErr.message);
@@ -1168,6 +1158,22 @@ app.post("/generate-session", requireAuth, generateLimiter, async (req, res) => 
       }
       console.error(`[elevenlabs] Audio generation failed: ${audioErr.message}`);
       audioUnavailable = true;
+    }
+
+    // ── [duration] — requested vs. delivered, unconditional, every generation ──
+    // The one line this task exists to add. Logged whether the audio
+    // succeeded, was marked unavailable, or failed outright (final=unknown in
+    // that last case) — on both generation paths, since this sits in shared
+    // code after the branch merges.
+    {
+      const requestedSeconds = mins * 60;
+      if (finalSeconds !== null) {
+        const deltaSeconds = Math.round(finalSeconds - requestedSeconds);
+        const pctOver = Math.round(100 * deltaSeconds / requestedSeconds);
+        console.log(`[duration] requested=${requestedSeconds}s estimated=${Math.round(estimatedTotalDuration)}s final=${Math.round(finalSeconds)}s delta=${deltaSeconds >= 0 ? "+" : ""}${deltaSeconds}s (${pctOver >= 0 ? "+" : ""}${pctOver}%)`);
+      } else {
+        console.log(`[duration] requested=${requestedSeconds}s estimated=${Math.round(estimatedTotalDuration)}s final=unknown (audio generation failed)`);
+      }
     }
 
     // Persist user's first name for personalised emails (fire-and-forget)
@@ -1644,30 +1650,90 @@ app.delete("/account", requireAuth, async (req, res) => {
 });
 
 // ─── TTS HELPERS ─────────────────────────────────────────────────────────────
-// Split an SSML script into chunks of at most maxChars, breaking only on
-// paragraph boundaries so SSML tags are never split mid-tag.
-function splitIntoTTSChunks(text, maxChars = 1500) {
-  const paragraphs = text.split(/\n\n+/);
-  const chunks = [];
-  let current = "";
-  for (const para of paragraphs) {
-    const candidate = current ? current + "\n\n" + para : para;
-    if (candidate.length > maxChars && current.length > 0) {
-      chunks.push(current);
-      current = para;
-    } else {
-      current = candidate;
-    }
-  }
-  if (current) chunks.push(current);
-  return chunks.filter(Boolean);
-}
-
 // ─── PROMPT ───────────────────────────────────────────────────────────────────
 // ─── SHARED HELPERS ──────────────────────────────────────────────────────────
 
 function countSpokenWords(text) {
   return text.replace(/<[^>]+>/g, "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+// Estimated total spoken duration of a script: spoken words at the session's
+// pace, plus every SSML break's seconds. Normalizes malformed break tags
+// first (same shape the LLM produces, same regex as the pre-TTS fix-up) so an
+// early estimate isn't undercounted by tags that haven't been repaired yet.
+// Shared by both generation paths — used to decide whether a script needs
+// trimming and, later, to log the pre-TTS duration estimate.
+function measureTotalSeconds(script, wpm) {
+  const normalized = script.replace(/<break\s+time=["']?([\d.]+)s["']?\s*\/?>/gi, '<break time="$1s"/>');
+  const breakSeconds = [...normalized.matchAll(/<break\s+time="([\d.]+)s"\s*\/>/g)]
+    .reduce((sum, m) => sum + parseFloat(m[1]), 0);
+  return (countSpokenWords(normalized) / wpm) * 60 + breakSeconds;
+}
+
+// ─── PAUSE CLASSIFICATION & WEIGHTED SILENCE DISTRIBUTION ────────────────────
+// Every <break> tag is a position marker only — its own authored duration is
+// discarded, and real silence is assembled afterward at whatever duration
+// this session actually needs (spoken time is measured, not guessed; silence
+// is exactly controllable, LLM output is not). Four pause types, weights
+// taken from what the script already authors at each kind of position, not
+// invented:
+//   boundary  — the fixed section-join break this file inserts itself,
+//               always exactly 3s (server.js's own generateSessionSections)
+//   countdown — inside a countdown line (its paragraph starts with a number
+//               word, Ten..One); SSML_RULES authors 6-8s here
+//   breathing — inside a breathing-cycle line (its paragraph contains both
+//               "breathe in" and "breathe out"); the BREATHING FORMAT
+//               template authors 5s/3s/6s/3s across its four breaks — 5.5 is
+//               the midpoint of the 5-6s band SSML_RULES assigns the type
+//   ordinary  — everything else; SSML_RULES' ordinary-sentence band is
+//               1.5-2.5s, the dominant sub-case folded into this catch-all
+const PAUSE_MIN_SECONDS = 1.0;
+const PAUSE_MAX_SECONDS = 10.0;
+const PAUSE_WEIGHTS = { boundary: 3, countdown: 7, breathing: 5.5, ordinary: 2 };
+const PAUSE_COUNTDOWN_NUMBER_RE = /^\s*(Ten|Nine|Eight|Seven|Six|Five|Four|Three|Two|One)\b/i;
+const PAUSE_BOUNDARY_MARKER = 'data-pause="boundary"';
+
+// Splits a script into an ordered {text, pauseType}[] — pauseType is the
+// classification of the pause that FOLLOWS this text segment, or null for
+// the script's final segment (nothing follows it). Classification looks at
+// the paragraph a break sits inside, not the break's own stated duration.
+function splitIntoPausePoints(script) {
+  const parts = script.split(/(\n\n+)/);
+  let stamped = "";
+  for (const part of parts) {
+    if (!part || /^\n\n+$/.test(part)) { stamped += part; continue; }
+    const type = part.includes(PAUSE_BOUNDARY_MARKER) ? "boundary"
+      : PAUSE_COUNTDOWN_NUMBER_RE.test(part) ? "countdown"
+      : (/breathe in/i.test(part) && /breathe out/i.test(part)) ? "breathing"
+      : "ordinary";
+    stamped += part.replace(/<break[^>]*\/>/gi, `<PAUSE t="${type}"/>`);
+  }
+  const raw = stamped.split(/<PAUSE t="(\w+)"\/>/);
+  const segments = [];
+  for (let i = 0; i < raw.length; i += 2) {
+    const text = raw[i].trim();
+    const pauseType = raw[i + 1] || null;
+    if (text) segments.push({ text, pauseType });
+  }
+  return segments;
+}
+
+// Weighted-proportional split of remainingSeconds across every pause point
+// in segments, clamped to [PAUSE_MIN_SECONDS, PAUSE_MAX_SECONDS]. Returns an
+// array parallel to segments — durations[i] is the silence after segments[i]
+// (undefined where segments[i].pauseType is null). Single-pass: clamping can
+// make the assigned total drift slightly from remainingSeconds when it binds
+// (logged, not corrected — the clamps exist precisely to cap how far a single
+// pause is allowed to drift from the target feel, so re-inflating other
+// pauses to compensate would undermine them).
+function computePauseDurations(segments, remainingSeconds) {
+  const totalWeight = segments.reduce((sum, s) => sum + (s.pauseType ? PAUSE_WEIGHTS[s.pauseType] : 0), 0);
+  return segments.map(s => {
+    if (!s.pauseType) return undefined;
+    if (totalWeight <= 0) return PAUSE_MIN_SECONDS;
+    const raw = remainingSeconds * (PAUSE_WEIGHTS[s.pauseType] / totalWeight);
+    return Math.max(PAUSE_MIN_SECONDS, Math.min(PAUSE_MAX_SECONDS, raw));
+  });
 }
 
 // ElevenLabs TTS with exponential-backoff retry (immediate → 1 s → 3 s).
@@ -1742,6 +1808,112 @@ Nine <break time="7s"/> deeper still <break time="2s"/>
 
 RULES: No stage directions. No parenthetical marks like (pause) or (breathe). No dots or ellipses. Output ONLY spoken words and <break> tags. No section headers or labels. Write in second person, slow flowing sentences with long vowels and natural breath points.`;
 
+function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+
+// Item counts inside a section scale continuously with that section's own
+// word budget instead of being fixed per tier — a fixed checklist ("1 scene
+// + 3 affirmations", "3 scenes + 6 affirmations") produces roughly constant
+// output regardless of the stated budget, confirmed empirically: the same
+// "1 scene + 3 affirmations" instruction produced 184 words against a
+// 120-word budget and 240 words against a 240-word budget. The model
+// responds to item counts, not the word target in the prompt — so the counts
+// themselves are now a function of budget.
+//
+// Induction: welcome + eye-fixation + closing overhead is small and fixed
+// (~35 words); breathing cycles and body-scan depth split the remainder in
+// the same ratio the original full spec used between them (3 cycles x 24
+// words = 72, vs. a 12-region x 2-sentence scan at ~10 words/sentence = 240;
+// 72:240). Breathing-cycle cost (24 words) is counted directly from the
+// BREATHING FORMAT template below with its break tags stripped.
+function inductionCounts(budget) {
+  const OVERHEAD = 35;
+  const remaining = Math.max(0, budget - OVERHEAD);
+  const breathingWords = remaining * (72 / 312);
+  const scanWords = remaining * (240 / 312);
+  const cycles = clamp(Math.round(breathingWords / 24), 0, 3);
+  // A body scan under 2 sentence-units isn't a body scan, it's one stray
+  // sentence — at that point a 5-minute session is better served skipping it
+  // entirely (this is the ~5-minute case: 5-minute sessions should have no
+  // body scan at all, only a settle-in).
+  const scanUnitsRaw = scanWords / 10;
+  const scanUnits = scanUnitsRaw < 2 ? 0 : clamp(Math.round(scanUnitsRaw), 2, 24);
+  let regions = 0, sentencesPerRegion = 0;
+  if (scanUnits >= 1) {
+    if (scanUnits <= 12) { regions = scanUnits; sentencesPerRegion = 1; }
+    else { regions = clamp(Math.round(scanUnits / 2), 1, 12); sentencesPerRegion = 2; }
+  }
+  return { cycles, regions, sentencesPerRegion };
+}
+
+// Deepener: the countdown itself (10 numbers) is fixed scaffolding — it
+// always happens, at every length. Only how much is said after each number
+// scales, and that one elastic item floors at 1 rather than dropping to 0:
+// a countdown number with nothing after it isn't a countdown, it's silence
+// with a label. Cost: ~6 words per added line, across 10 numbers = 60
+// words per step up.
+function deepenerLinesPerNumber(budget) {
+  const OVERHEAD = 20; // 1 transition sentence + 1 closing sentence
+  const remaining = Math.max(0, budget - OVERHEAD - 10); // 10 = the bare number words themselves, 1 each
+  return clamp(Math.round(remaining / 60), 1, 4);
+}
+
+// Therapeutic: visualization scenes and affirmations split the remainder in
+// the original full spec's own ratio (3 scenes : 6 affirmations = 3:1 by
+// item, 360:120 by the words below). Per-item costs are back-calculated from
+// two real measurements, not assumed — "1 scene + 3 affirmations x2" (spoken
+// twice) averaged ~212 words; "3 scenes + 6 affirmations x2" averaged ~542
+// words. Solving those two data points for scene cost and per-utterance
+// affirmation cost gives ~130 words/scene and ~10 words/affirmation-utterance
+// (2 utterances per affirmation when spoken twice).
+// Ceiling raised from 3/6 to 4/8 so 30-min has headroom (its raw formula
+// value before clamping is 4.04 scenes / 8.75 affirmations — it was
+// genuinely ceiling-bound at the old 3/6, unlike 20-min, whose raw values
+// (2.65 scenes / 5.75 affirmations) round to 3/6 on their own and are NOT
+// clamped — confirmed by checking the unclamped arithmetic before raising
+// this, and re-verified by re-running 20-min after the change, not assumed.
+function therapeuticCounts(budget) {
+  const OVERHEAD = 20;
+  const remaining = Math.max(0, budget - OVERHEAD);
+  const sceneWords = remaining * 0.75;
+  const affWords = remaining * 0.25;
+  // Under 1 full scene's worth of budget, a visualization scene isn't
+  // affordable at all — this is the 5-minute case ("...one suggestion, no
+  // visualization scene"); a 5-min session delivers its one core suggestion
+  // without a full staged scene.
+  const sceneRatio = sceneWords / 130;
+  const scenes = sceneRatio < 1.0 ? 0 : clamp(Math.round(sceneRatio), 1, 4);
+  // Below 30 affirmation-words there isn't room to repeat even one
+  // affirmation, so it's spoken once — this is what "minimal affirmations"
+  // at 5 minutes resolves to: 1-2 affirmations, spoken once each, instead of
+  // fewer affirmations each spoken twice.
+  const repeatTwice = affWords >= 30;
+  const perAffirmationCost = repeatTwice ? 20 : 10;
+  const affirmations = clamp(Math.round(affWords / perAffirmationCost), 0, repeatTwice ? 8 : 3);
+  return { scenes, affirmations, repeatTwice };
+}
+
+// Emergence is the one section with a safety function: bringing someone out
+// of trance needs reorientation content at every count, not a bare number —
+// unlike the other elastic items, this floor is not allowed to reach 0.
+// EMERGENCE_WORD_FLOOR (60 words = intro ~10 + 5 counts x 1 short sentence
+// ~8 words each = 40 + closing ~10) is a hard minimum computed from what a
+// safe emergence needs, independent of the session's word budget — if the
+// weighted budget would give emergence less than this, generateSessionSections()
+// takes the difference out of the other four sections' budgets instead of
+// letting emergence fall short or inflating total session length.
+const EMERGENCE_WORD_FLOOR = 60;
+function emergenceSentencesPerNumber(budget) {
+  return 1 + clamp(Math.round((budget - EMERGENCE_WORD_FLOOR) / 40), 0, 2);
+}
+
+// Reinforcement has no safety role — it scales freely, all the way to 0
+// middle items at the tightest budgets (closing alone still happens).
+function reinforcementMiddleCount(budget) {
+  const CLOSING_COST = 15;
+  const remaining = Math.max(0, budget - CLOSING_COST);
+  return clamp(Math.round(remaining / 40), 0, 3);
+}
+
 function buildSectionPrompt(section, budget, ctx) {
   const { name, goal, program, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle } = ctx;
 
@@ -1760,7 +1932,7 @@ function buildSectionPrompt(section, budget, ctx) {
     "Future tense":  "Write affirmations as future certainties.",
   }[affirmationStyle] || 'Use "I am…" affirmations.';
 
-  const footer = `MINIMUM: ${budget} spoken words (SSML tags do not count). Hard floor — expand with more imagery or repetition if you finish early.
+  const footer = `MINIMUM: ${budget} spoken words (SSML tags do not count).
 
 ${SSML_RULES}
 
@@ -1780,79 +1952,94 @@ User: ${name} | Goal: "${goal}" | Program: ${program} | Style: ${style || "Gentl
   };
 
   switch (section) {
-    case "induction":
+    case "induction": {
+      const { cycles, regions, sentencesPerRegion } = inductionCounts(budget);
+      const steps = [`Welcome ${name} warmly and invite them to settle in`];
+      if (cycles >= 1) steps.push(`Lead exactly ${cycles} complete breathing cycle${cycles > 1 ? "s" : ""} using the breathing format below`);
+      if (regions >= 1) steps.push(`Guide a body scan covering ${regions} body area${regions > 1 ? "s" : ""}, ${sentencesPerRegion} sentence${sentencesPerRegion > 1 ? "s" : ""} each`);
+      steps.push(`Use an eye-fixation or downward-gaze suggestion to begin inducing trance`);
+      steps.push(`End with ${name} feeling heavy, warm, and ready to go further`);
+      const numbered = steps.map((s, i) => `${i + 1}. ${s}`).join("\n");
       return `Write the INDUCTION section of a personalized hypnosis session for ${name}.
 
 This is the first thing the listener hears. Your job:
-1. Welcome ${name} warmly and invite them to settle in
-2. Lead exactly 3 complete breathing cycles using the breathing format below
-3. Guide a progressive body scan from head to toe (at least 2 sentences per region: scalp, face, neck, shoulders, chest, arms, hands, belly, lower back, hips, legs, feet)
-4. Use eye-fixation or downward-gaze suggestions to begin inducing trance
-5. End with ${name} feeling heavy, warm, and deeply ready to go further
+${numbered}
 
 Do NOT include any countdown, therapeutic suggestions, or awakening language — those come later.
 The next section will count ${name} down from 10 to 1.
 
 ${footer}`;
+    }
 
-    case "deepener":
+    case "deepener": {
+      const linesPerNumber = deepenerLinesPerNumber(budget);
       return `Write the DEEPENER section of a personalized hypnosis session for ${name}.
 
 ${name} just completed a relaxation induction and is already calm but not yet in deep trance.
-Your job: deepen their trance state significantly using a countdown.
+Your job: deepen their trance state using a countdown.
 
-1. Open with 1–2 transition sentences ("And as you go deeper now…")
-2. Count DOWN from 10 to 1 using the countdown format below — after each number write 3–4 lines of deepening suggestions
-3. Weave in vivid imagery: a warm staircase descending, a peaceful elevator, a soft cloud
-4. End with ${name} in profound, receptive stillness
+1. Open with 1 short transition sentence ("And as you go deeper now…")
+2. Count DOWN from 10 to 1 using the countdown format below — after each number write exactly ${linesPerNumber} line${linesPerNumber > 1 ? "s" : ""} of deepening suggestions
+3. End with ${name} in profound, receptive stillness
 
 Do NOT repeat the body scan or breathing exercises from the previous section.
 Do NOT include therapeutic suggestions — those come next.
 
 ${footer}`;
+    }
 
-    case "therapeutic":
+    case "therapeutic": {
+      const { scenes, affirmations, repeatTwice } = therapeuticCounts(budget);
+      const steps = [`Open with 1 sentence acknowledging how deeply relaxed ${name} is`];
+      steps.push(`Deliver core program suggestions tied to "${goal}"`);
+      if (scenes >= 1) steps.push(`Create exactly ${scenes} visualization scene${scenes > 1 ? "s" : ""} with sensory detail${scenes < 3 ? " (pick 2 senses, not all 5)" : " (sight, sound, smell, touch, feeling)"}`);
+      if (affirmations >= 1) steps.push(`Include exactly ${affirmations} affirmation${affirmations > 1 ? "s" : ""} tied to "${goal}"${repeatTwice ? ", each spoken twice with a pause between" : ", spoken once"}. ${affirmGuide}`);
+      steps.push(`Weave "${goal}" throughout — every suggestion should feel personally written for ${name}`);
+      if (endings[program]) steps.push(endings[program]);
+      const numbered = steps.map((s, i) => `${i + 1}. ${s}`).join("\n");
       return `Write the THERAPEUTIC CONTENT section of a personalized hypnosis session for ${name}.
 
-${name} is in deep trance and maximally receptive. This is the core and longest section.
+${name} is in deep trance and maximally receptive. This is the core section.
 Your job: deliver deeply personalized therapeutic suggestions for the program "${program}".
 
-1. Open with 2 sentences acknowledging how deeply relaxed ${name} is
-2. Deliver core program suggestions: vivid visualizations, metaphors, and affirmations tied to "${goal}"
-3. Create at least 3 distinct visualization scenes with full sensory detail (sight, sound, smell, touch, feeling)
-4. Include 6 affirmations tied to "${goal}", each spoken twice with a pause between. ${affirmGuide}
-5. Weave "${goal}" throughout — every suggestion should feel personally written for ${name}
-6. Use repetition and varied wording to reinforce each suggestion
-${endings[program] ? `7. ${endings[program]}` : ""}
+${numbered}
 
 CRITICAL: Do NOT include any awakening language. Never say "open your eyes", "returning to the room", "wiggle your fingers", or "wide awake". These are forbidden here.
 
 ${footer}`;
+    }
 
-    case "reinforcement":
+    case "reinforcement": {
+      const middleCount = reinforcementMiddleCount(budget);
+      const middleItems = [
+        `Create a post-hypnotic anchor: a word or sensation that recalls these feelings ("Every time you take a deep breath and say to yourself…"), in 1 sentence`,
+        `Future-pace how ${name} will feel and act in the coming days, in 1 sentence`,
+        `Reinforce that the changes are real and already taking root, in 1 sentence`,
+      ];
+      const steps = middleItems.slice(0, middleCount);
+      steps.push(`End with 1 sentence of profound completion and quiet confidence`);
+      const numbered = steps.map((s, i) => `${i + 1}. ${s}`).join("\n");
       return `Write the REINFORCEMENT section of a personalized hypnosis session for ${name}.
 
 The therapeutic suggestions have just been delivered. ${name} is still in deep trance.
 Your job: anchor the suggestions as permanent, automatic changes.
 
-1. Create a post-hypnotic anchor: a word or sensation that recalls these feelings ("Every time you take a deep breath and say to yourself…")
-2. Future-pace: describe how ${name} will feel and act in the coming days and weeks
-3. Reinforce that the changes are real, already taking root, and growing stronger daily
-4. Use a bridge phrase: "From this moment forward…" or "With every passing day…"
-5. End with profound completion and quiet confidence
+${numbered}
 
 Do NOT include awakening language — that comes in the very next and final section.
 
 ${footer}`;
+    }
 
-    case "emergence":
+    case "emergence": {
+      const sentencesPerNumber = emergenceSentencesPerNumber(budget);
       return `Write the EMERGENCE section of a personalized hypnosis session for ${name}.
 
-All suggestions have been delivered. Your job: gently return ${name} to full waking awareness.
+All suggestions have been delivered. Your job: gently return ${name} to full waking awareness. This step is a safety step, not optional — ${name} must be brought back to full alertness properly, do not rush or skip counts.
 
 1. Begin: "In a moment, I'll count from 1 to 5…"
 2. Count 1 to 5 — each number brings more alertness (1 = deeply relaxed, 5 = fully alert and refreshed)
-3. After each number, add 2–3 sentences of returning awareness and positive reinforcement
+3. After each number, write exactly ${sentencesPerNumber} sentence${sentencesPerNumber > 1 ? "s" : ""} of returning awareness and positive reinforcement — never zero, every count needs reorientation content
 4. At 5, ${name} opens their eyes feeling refreshed, energized, and deeply well
 5. End with a warm, grounding close
 
@@ -1860,20 +2047,70 @@ This is the ONLY section where awakening language is permitted.
 Do NOT add more therapeutic suggestions — that work is complete.
 
 ${footer}`;
+    }
 
     default:
       throw new Error(`Unknown section: ${section}`);
   }
 }
 
-async function generateSessionSections({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, wordTarget, maxTokens }) {
-  const budgets = {
-    induction:     Math.round(wordTarget * 0.20),
-    deepener:      Math.round(wordTarget * 0.15),
-    therapeutic:   Math.round(wordTarget * 0.40),
-    reinforcement: Math.round(wordTarget * 0.15),
-    emergence:     Math.round(wordTarget * 0.10),
-  };
+// Time share of each section, not word share — deepener gets the same 15% of
+// the session's SECONDS whether that time comes out mostly as words or mostly
+// as silence.
+const SECTION_TIME_WEIGHTS = { induction: 0.20, deepener: 0.15, therapeutic: 0.40, reinforcement: 0.15, emergence: 0.10 };
+
+// Break-seconds-per-spoken-word, applied uniformly to every section — used to
+// convert each section's time budget into a word budget up front, before
+// generating anything (the single-call path measures actual breaks after
+// generation and trims in up to 2 passes to converge; the section path knows
+// its section list in advance, so it should budget correctly the first time
+// instead).
+//
+// Not measured on section-path output — there was none to measure yet.
+// Derived from a real single-call session (2026-09-11): the rest of that
+// script (everything but its countdown) measured 346s of break time over 862
+// spoken words, ~0.40s/word.
+//
+// The countdown itself measured a much denser ~1.84s/word (90s over 49
+// words) in that same session — but that ratio does NOT transfer to this
+// path's "deepener" section. The single-call countdown template is terse,
+// one short phrase per number; buildSectionPrompt's deepener case instead
+// asks for "3–4 lines of deepening suggestions" after each number — 5-10x
+// more prose per number than the template that produced 1.84s/word. Giving
+// deepener that ratio was tried first and produced a 37-word budget for 10
+// numbers plus transition and imagery, which is not enough to satisfy its
+// own prompt's "3-4 lines per number" instruction — checked against the
+// prompt text directly, not assumed. Using the uniform prose ratio instead.
+//
+// Recalibrate once real section-path measurements exist — the [section]
+// logging below reports actual vs. budgeted every run, specifically so this
+// can be checked against reality instead of re-guessed.
+const BREAK_SECONDS_PER_WORD = 0.40;
+
+async function generateSessionSections({ name, goal, program, voice, background, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle, wordTarget, maxTokens, mins, pacedWpm }) {
+  const targetSeconds = mins * 60;
+  const secondsPerWordSpeech = 60 / pacedWpm;
+  const budgets = {};
+  for (const [section, weight] of Object.entries(SECTION_TIME_WEIGHTS)) {
+    const secTargetSeconds = targetSeconds * weight;
+    budgets[section] = Math.max(20, Math.round(secTargetSeconds / (secondsPerWordSpeech + BREAK_SECONDS_PER_WORD)));
+  }
+  // Emergence's weighted share can fall below what a safe emergence needs at
+  // short lengths (e.g. 30 words at 5 min) — its budget isn't overshootable
+  // content shrinking to fit, its budget is unrealistic. Floor it at
+  // EMERGENCE_WORD_FLOOR and take the difference out of the other four
+  // sections' budgets, proportionally, rather than inflating total length.
+  const emergenceDeficit = Math.max(0, EMERGENCE_WORD_FLOOR - budgets.emergence);
+  if (emergenceDeficit > 0) {
+    const others = ["induction", "deepener", "therapeutic", "reinforcement"];
+    const othersSum = others.reduce((sum, k) => sum + budgets[k], 0);
+    for (const k of others) {
+      budgets[k] = Math.max(20, budgets[k] - Math.round(emergenceDeficit * (budgets[k] / othersSum)));
+    }
+    budgets.emergence = EMERGENCE_WORD_FLOOR;
+    console.log(`[section] Emergence floor (${EMERGENCE_WORD_FLOOR} words) exceeded its weighted budget — reallocated ${emergenceDeficit} words from the other four sections.`);
+  }
+  console.log(`[section] Duration-aware budgets (targetSeconds=${Math.round(targetSeconds)}, pacedWpm=${pacedWpm}): ${JSON.stringify(budgets)} (word-target-only budgets would have been ${JSON.stringify(Object.fromEntries(Object.entries(SECTION_TIME_WEIGHTS).map(([k, w]) => [k, Math.round(wordTarget * w)])))})`);
   const ctx = { name, goal, program, style, personalization, fears, motivation, idealLife, deepQ1, deepQ2, deepQ3, deepQ4, affirmationStyle };
   const headers = { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" };
 
@@ -1898,7 +2135,6 @@ async function generateSessionSections({ name, goal, program, voice, background,
     return text;
   }
 
-  console.log(`[section] Parallel generation: ${JSON.stringify(budgets)}`);
   const [induction, deepener, therapeutic, reinforcement, emergence] = await Promise.all([
     callSection("induction",     budgets.induction),
     callSection("deepener",      budgets.deepener),
@@ -1923,9 +2159,17 @@ async function generateSessionSections({ name, goal, program, voice, background,
   const total = Object.values(sections).reduce((s, t) => s + countSpokenWords(t), 0);
   console.log(`[section] Total spoken words: ${total} (target ${wordTarget}, ${Math.round(total/wordTarget*100)}%)`);
 
-  return ["induction", "deepener", "therapeutic", "reinforcement", "emergence"]
+  const joined = ["induction", "deepener", "therapeutic", "reinforcement", "emergence"]
     .map(k => sections[k])
-    .join('\n\n<break time="3s"/>\n\n');
+    .join(`\n\n<break time="3s" ${PAUSE_BOUNDARY_MARKER}/>\n\n`);
+
+  // Whole-session measurement — the up-front per-section budgets above are the
+  // primary mechanism; this is visibility into how well they actually landed,
+  // plus the input to the single bounded safety-net trim in the caller.
+  const joinedEstimatedSeconds = measureTotalSeconds(joined, pacedWpm);
+  console.log(`[section] Estimated total duration: ${Math.round(joinedEstimatedSeconds)}s vs target ${Math.round(targetSeconds)}s (${Math.round(100 * joinedEstimatedSeconds / targetSeconds)}%)`);
+
+  return joined;
 }
 
 // ─── PROMPT (single-call fallback) ───────────────────────────────────────────
